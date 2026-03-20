@@ -1,801 +1,869 @@
 """
-CleanCook Streamlit App v3
+CleanCook Streamlit App v6
 ===========================
-Geolocation:
-  - NO fallback. The user must confirm their school location before anything is plotted.
-  - Nominatim returns up to 5 candidate results.
-  - User picks the correct one from a list, or manually enters coordinates.
-  - Only after confirmation does the map render and calculations proceed.
+Geolocation change:
+  - NO text search. NO Nominatim. NO OSM dependency.
+  - User opens an interactive Kenya map and CLICKS to place their school pin.
+  - The click coordinates are captured by streamlit-folium's returned data.
+  - Coordinates shown live; user confirms with a button.
+  - Works for ANY school in Kenya — regardless of OSM coverage.
+
+All other v5 features retained:
+  - Ingredient-level Kenya meal cost engine (KIPPRA 2024 data)
+  - Firewood vs clean cooking savings analysis
+  - Equipment sizing & amortisation
+  - LangChain agent + Tavily due diligence
 
 Requirements:
-    pip install streamlit langchain langchain-openai langchain-tavily langgraph folium streamlit-folium requests
+    pip install streamlit langchain langchain-openai langchain-tavily langgraph folium streamlit-folium requests python-dotenv
 
 Run:
-    export OPENAI_API_KEY=sk-...
-    export TAVILY_API_KEY=tvly-...
     streamlit run cleancook_app.py
 """
 
-import os
-import json
-import math
-import requests
+import os, json, math, requests
 import streamlit as st
 import folium
+from folium.plugins import MousePosition
 from streamlit_folium import st_folium
-
 from langchain.tools import tool
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
-from dotenv import load_dotenv
 
+try:
+    from dotenv import load_dotenv; load_dotenv()
+except ImportError:
+    pass
 
-load_dotenv()  # Load environment variables from .env file if present   
+st.set_page_config(page_title="CleanCook — School Energy Transition",
+                   page_icon="🔥", layout="wide", initial_sidebar_state="expanded")
 
-
-# ─────────────────────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="CleanCook — School Energy Transition",
-    page_icon="🔥",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ─────────────────────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap');
-  html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-
-  .main-title  { font-family:'DM Serif Display',serif; font-size:2.4rem; color:#1a6b3c; line-height:1.2; margin-bottom:0; }
-  .subtitle    { color:#666; font-size:1rem; margin-top:4px; }
-
-  .metric-card { background:white; border:1px solid #ddd8cc; border-radius:12px; padding:18px 20px; text-align:center; box-shadow:0 2px 6px rgba(0,0,0,.04); }
-  .metric-val  { font-family:'DM Serif Display',serif; font-size:1.8rem; color:#1a6b3c; }
-  .metric-lbl  { font-size:0.78rem; color:#888; text-transform:uppercase; letter-spacing:.4px; }
-
-  .section-head { font-family:'DM Serif Display',serif; font-size:1.3rem; color:#1c1c1c; border-bottom:2px solid #e8f5ee; padding-bottom:8px; margin-bottom:16px; }
-
-  .candidate-card {
-    background: white; border: 2px solid #ddd8cc; border-radius: 10px;
-    padding: 14px 16px; margin-bottom: 10px; cursor: pointer;
-    transition: border-color 0.2s;
-  }
-  .candidate-card:hover { border-color: #1a6b3c; }
-  .candidate-card.selected { border-color: #1a6b3c; background: #e8f5ee; }
-  .candidate-type { font-size:.75rem; color:#888; text-transform:uppercase; letter-spacing:.4px; }
-  .candidate-name { font-size:.97rem; font-weight:600; color:#1c1c1c; }
-  .candidate-addr { font-size:.82rem; color:#666; margin-top:2px; }
-  .candidate-coord { font-size:.78rem; color:#1a6b3c; font-family:monospace; margin-top:4px; }
-
-  .geo-confirmed { background:#e8f5ee; border:2px solid #1a6b3c; border-radius:10px; padding:12px 16px; font-size:.9rem; color:#1a4a2c; margin-bottom:12px; }
-  .geo-pending   { background:#fdf3e7; border:2px solid #e07b2a; border-radius:10px; padding:12px 16px; font-size:.9rem; color:#7a4a1a; margin-bottom:12px; }
-  .geo-search-hint { background:#f0f4ff; border:1px solid #b3c6f5; border-radius:8px; padding:10px 14px; font-size:.85rem; color:#2a3a7a; margin-bottom:12px; }
-
-  .calc-step    { background:#f7f7f4; border-left:4px solid #1a6b3c; border-radius:0 10px 10px 0; padding:14px 18px; margin-bottom:12px; font-size:.93rem; line-height:1.7; }
-  .calc-formula { background:#1c1c1c; color:#7ee8a2; border-radius:8px; padding:12px 16px; font-family:monospace; font-size:.9rem; margin:8px 0; white-space:pre; }
-  .calc-example { background:#e8f5ee; border-radius:8px; padding:10px 14px; font-size:.88rem; color:#1a4a2c; margin:6px 0; }
-
-  .dd-card   { background:#f7f7f4; border-left:4px solid #1a6b3c; border-radius:0 10px 10px 0; padding:14px 18px; margin-bottom:10px; font-size:.93rem; line-height:1.6; }
-  .dd-source { font-size:.75rem; color:#888; margin-top:4px; }
-  .warning-box { background:#fdf3e7; border-left:4px solid #e07b2a; border-radius:0 10px 10px 0; padding:12px 16px; font-size:.88rem; color:#7a4a1a; }
-
-  .stButton > button { background:#1a6b3c !important; color:white !important; border-radius:8px !important; font-weight:600 !important; border:none !important; padding:10px 24px !important; }
-  .stButton > button:hover { background:#2d9058 !important; }
-
-  div[data-testid="stRadio"] label { cursor: pointer; }
+  html,body,[class*="css"]{font-family:'DM Sans',sans-serif;}
+  .main-title{font-family:'DM Serif Display',serif;font-size:2.4rem;color:#1a6b3c;line-height:1.2;margin-bottom:0;}
+  .subtitle{color:#666;font-size:1rem;margin-top:4px;}
+  .metric-card{background:white;border:1px solid #ddd8cc;border-radius:12px;padding:18px 20px;text-align:center;box-shadow:0 2px 6px rgba(0,0,0,.04);}
+  .metric-val{font-family:'DM Serif Display',serif;font-size:1.8rem;color:#1a6b3c;}
+  .metric-val.red{color:#c0392b;} .metric-val.amber{color:#e07b2a;} .metric-val.green{color:#1a6b3c;}
+  .metric-lbl{font-size:0.78rem;color:#888;text-transform:uppercase;letter-spacing:.4px;}
+  .section-head{font-family:'DM Serif Display',serif;font-size:1.3rem;color:#1c1c1c;border-bottom:2px solid #e8f5ee;padding-bottom:8px;margin-bottom:16px;}
+  .saving-banner{background:linear-gradient(135deg,#1a6b3c,#2d9058);color:white;border-radius:14px;padding:24px 32px;text-align:center;margin:16px 0;}
+  .saving-banner .big{font-family:'DM Serif Display',serif;font-size:3rem;line-height:1;}
+  .saving-banner .lbl{font-size:1rem;opacity:.85;margin-top:4px;}
+  .cost-fw{background:#fde8e8;border-left:4px solid #c0392b;border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:6px;font-size:.9rem;}
+  .cost-cc{background:#e8f5ee;border-left:4px solid #1a6b3c;border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:6px;font-size:.9rem;}
+  .cost-neu{background:#f7f7f4;border-left:4px solid #888;border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:6px;font-size:.9rem;}
+  .source-badge{background:#f0f7f3;border:1px solid #b3ddc0;border-radius:6px;padding:4px 10px;font-size:.75rem;color:#1a4a2c;display:inline-block;margin:2px 0;}
+  .calc-step{background:#f7f7f4;border-left:4px solid #1a6b3c;border-radius:0 10px 10px 0;padding:14px 18px;margin-bottom:12px;font-size:.93rem;line-height:1.7;}
+  .calc-formula{background:#1c1c1c;color:#7ee8a2;border-radius:8px;padding:12px 16px;font-family:monospace;font-size:.9rem;margin:8px 0;white-space:pre;}
+  .calc-example{background:#e8f5ee;border-radius:8px;padding:10px 14px;font-size:.88rem;color:#1a4a2c;margin:6px 0;}
+  .dd-card{background:#f7f7f4;border-left:4px solid #1a6b3c;border-radius:0 10px 10px 0;padding:14px 18px;margin-bottom:10px;font-size:.93rem;line-height:1.6;}
+  .dd-source{font-size:.75rem;color:#888;margin-top:4px;}
+  .warning-box{background:#fdf3e7;border-left:4px solid #e07b2a;border-radius:0 10px 10px 0;padding:12px 16px;font-size:.88rem;color:#7a4a1a;}
+  .geo-confirmed{background:#e8f5ee;border:2px solid #1a6b3c;border-radius:10px;padding:12px 16px;font-size:.9rem;color:#1a4a2c;margin-bottom:12px;}
+  .pin-hint{background:#f0f7ff;border:2px dashed #4a90d9;border-radius:10px;padding:20px 24px;text-align:center;font-size:1rem;color:#1a3a6b;margin-bottom:16px;}
+  .pin-pending{background:#fdf3e7;border:2px solid #e07b2a;border-radius:10px;padding:12px 16px;font-size:.9rem;color:#7a4a1a;margin-bottom:12px;}
+  .stButton>button{background:#1a6b3c !important;color:white !important;border-radius:8px !important;font-weight:600 !important;border:none !important;padding:10px 24px !important;}
+  .stButton>button:hover{background:#2d9058 !important;}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────
-# NOMINATIM — returns multiple candidates, no fallback
-# ─────────────────────────────────────────────────────────────
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-HEADERS       = {"User-Agent": "CleanCookApp/3.0 (school-energy-transition-kenya)"}
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def search_nominatim(query: str, limit: int = 5) -> list[dict]:
-    """
-    Search Nominatim for a place. Returns up to `limit` candidate results.
-    Each result: {lat, lng, display_name, type, osm_type, importance}
-    Returns empty list if nothing found — NO fallback.
-    """
-    try:
-        params = {
-            "q":            query,
-            "format":       "json",
-            "limit":        limit,
-            "countrycodes": "ke",
-            "addressdetails": 1,
-        }
-        resp = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        raw = resp.json()
-        candidates = []
-        for r in raw:
-            addr = r.get("address", {})
-            # Build a clean short label
-            parts = [
-                addr.get("amenity") or addr.get("building") or addr.get("tourism") or r.get("name", ""),
-                addr.get("suburb") or addr.get("neighbourhood") or addr.get("village") or addr.get("town") or "",
-                addr.get("county") or addr.get("state_district") or "",
-            ]
-            short_label = ", ".join(p for p in parts if p) or r.get("display_name", "")[:60]
-            candidates.append({
-                "lat":          float(r["lat"]),
-                "lng":          float(r["lon"]),
-                "display_name": r.get("display_name", ""),
-                "short_label":  short_label,
-                "type":         r.get("type", ""),
-                "osm_type":     r.get("osm_type", ""),
-                "importance":   r.get("importance", 0),
-            })
-        return candidates
-    except Exception:
-        return []
-
-
-def offset_coords(lat: float, lng: float, d_km: float, bearing_deg: float):
-    R = 6371
-    b = math.radians(bearing_deg)
-    lr = math.radians(lat)
-    lat2 = math.asin(math.sin(lr)*math.cos(d_km/R) + math.cos(lr)*math.sin(d_km/R)*math.cos(b))
-    lng2 = math.radians(lng) + math.atan2(
-        math.sin(b)*math.sin(d_km/R)*math.cos(lr),
-        math.cos(d_km/R) - math.sin(lr)*math.sin(lat2))
+# ─── HELPERS ──────────────────────────────────────────────────
+def offset_coords(lat, lng, d, b):
+    R=6371; b=math.radians(b); lr=math.radians(lat)
+    lat2=math.asin(math.sin(lr)*math.cos(d/R)+math.cos(lr)*math.sin(d/R)*math.cos(b))
+    lng2=math.radians(lng)+math.atan2(math.sin(b)*math.sin(d/R)*math.cos(lr),
+                                       math.cos(d/R)-math.sin(lr)*math.sin(lat2))
     return math.degrees(lat2), math.degrees(lng2)
 
 
-# ─────────────────────────────────────────────────────────────
-# CALCULATION ENGINE
-# ─────────────────────────────────────────────────────────────
-LITRES_PER_STUDENT_PER_MEAL = 5
-POT_FILL_RATIO              = 0.80
-REDUNDANCY_FACTOR           = 1.20
-STOVE_COSTS  = {"LPG": {200:35_000,100:22_000,50:14_000}, "Electric":{200:55_000,100:38_000,50:22_000}}
-POT_COSTS    = {200:28_000, 100:16_000, 50:9_000}
-INFRA_COSTS  = {"LPG":18_000, "Electric":25_000}
-INSTALL_RATE = {"LPG":0.15,   "Electric":0.20}
+# ─── COMMODITY PRICES (Kenya 2025) ────────────────────────────
+COMMODITY_DEFAULTS = {
+    "maize_flour_kg":    {"default":58,  "unit":"KES/kg","label":"Maize flour",       "desc":"~KES 5,200/90kg bag"},
+    "beans_kg":          {"default":90,  "unit":"KES/kg","label":"Dry beans",         "desc":"~KES 8,100/90kg bag"},
+    "rice_kg":           {"default":120, "unit":"KES/kg","label":"Rice",              "desc":"Pishori/broken rice"},
+    "sorghum_millet_kg": {"default":50,  "unit":"KES/kg","label":"Sorghum/millet",    "desc":"For uji porridge"},
+    "omena_kg":          {"default":200, "unit":"KES/kg","label":"Omena (dried fish)","desc":"Budget protein"},
+    "meat_kg":           {"default":650, "unit":"KES/kg","label":"Beef/goat meat",    "desc":"Bulk buying price"},
+    "sukuma_wiki_kg":    {"default":25,  "unit":"KES/kg","label":"Sukuma wiki",       "desc":"Most common school veg"},
+    "tomatoes_kg":       {"default":60,  "unit":"KES/kg","label":"Tomatoes",          "desc":"For stew base"},
+    "cooking_oil_L":     {"default":230, "unit":"KES/L", "label":"Cooking oil",       "desc":"20L jerrican ÷ 20"},
+    "salt_kg":           {"default":20,  "unit":"KES/kg","label":"Salt",              "desc":"Bulk institutional"},
+    "milk_L":            {"default":65,  "unit":"KES/L", "label":"Milk",              "desc":"Bulk/UHT for tea"},
+    "tea_leaves_kg":     {"default":400, "unit":"KES/kg","label":"Tea leaves",        "desc":"Kericho loose leaf"},
+    "sugar_kg":          {"default":160, "unit":"KES/kg","label":"Sugar",             "desc":"Retail white sugar"},
+    "labour_overhead_pct":{"default":20, "unit":"%",     "label":"Labour & overhead", "desc":"% of food cost"},
+}
+
+MEAL_RECIPES = {
+    "breakfast":{
+        "label":"🌅 Breakfast","desc":"Uji porridge + milk tea",
+        "ingredients":[
+            {"commodity":"sorghum_millet_kg","grams":30,"notes":"Uji flour"},
+            {"commodity":"maize_flour_kg",   "grams":20,"notes":"Maize blend"},
+            {"commodity":"sugar_kg",         "grams":15,"notes":"Porridge sugar"},
+            {"commodity":"milk_L",           "grams":50,"notes":"Porridge milk"},
+            {"commodity":"tea_leaves_kg",    "grams":2, "notes":"Tea leaves"},
+            {"commodity":"milk_L",           "grams":60,"notes":"Tea milk"},
+            {"commodity":"sugar_kg",         "grams":10,"notes":"Tea sugar"},
+        ],
+        "firewood_fuel_share":0.10,
+    },
+    "lunch":{
+        "label":"☀️ Lunch","desc":"Ugali + githeri + sukuma wiki",
+        "ingredients":[
+            {"commodity":"maize_flour_kg","grams":300,"notes":"Ugali flour"},
+            {"commodity":"beans_kg",      "grams":80, "notes":"Githeri beans"},
+            {"commodity":"maize_flour_kg","grams":30, "notes":"Githeri maize"},
+            {"commodity":"sukuma_wiki_kg","grams":80, "notes":"Kale side"},
+            {"commodity":"tomatoes_kg",   "grams":30, "notes":"Sukuma base"},
+            {"commodity":"cooking_oil_L", "grams":8,  "notes":"Cooking oil"},
+            {"commodity":"salt_kg",       "grams":3,  "notes":"Salt"},
+        ],
+        "firewood_fuel_share":0.22,
+    },
+    "supper":{
+        "label":"🌙 Supper","desc":"Rice/ugali + omena/beans stew + vegetables",
+        "ingredients":[
+            {"commodity":"rice_kg",       "grams":150,"notes":"Rice (dry)"},
+            {"commodity":"maize_flour_kg","grams":100,"notes":"Ugali (alt days)"},
+            {"commodity":"omena_kg",      "grams":30, "notes":"Omena stew"},
+            {"commodity":"beans_kg",      "grams":50, "notes":"Beans stew"},
+            {"commodity":"sukuma_wiki_kg","grams":60, "notes":"Cooked greens"},
+            {"commodity":"tomatoes_kg",   "grams":40, "notes":"Stew base"},
+            {"commodity":"cooking_oil_L", "grams":12, "notes":"Cooking oil"},
+            {"commodity":"salt_kg",       "grams":3,  "notes":"Salt"},
+        ],
+        "firewood_fuel_share":0.20,
+    },
+}
+
+WEEKS_PER_TERM=13; DAYS_PER_WEEK=7; TERMS_PER_YEAR=3
+EQUIPMENT_LIFE=7; CLEAN_FUEL_SAVE=0.40
 
 
-def calculate_sizing(n: int, m: int) -> dict:
-    total = n * m * LITRES_PER_STUDENT_PER_MEAL
-    alloc = {}; rem = total
-    for sz in [200, 100, 50]:
-        cnt = int(rem // (sz * POT_FILL_RATIO))
-        if cnt > 0:
-            alloc[sz] = cnt; rem -= cnt * sz * POT_FILL_RATIO
-    if rem > 0:
-        alloc[50] = alloc.get(50, 0) + 1
-    tp = sum(alloc.values())
-    return {"total_litres": total, "pot_alloc": alloc, "total_pots": tp,
-            "stoves_needed": math.ceil(tp * REDUNDANCY_FACTOR)}
+def compute_meal_cost(meal_key, prices):
+    recipe=MEAL_RECIPES[meal_key]; labour_pct=prices["labour_overhead_pct"]/100
+    ingredients=[]; food_cost=0.0
+    for ing in recipe["ingredients"]:
+        com=ing["commodity"]; p=prices[com]; cost=(ing["grams"]/1000)*p
+        food_cost+=cost
+        ingredients.append({"name":COMMODITY_DEFAULTS[com]["label"],
+            "qty":f"{ing['grams']}{'ml' if '_L' in com else 'g'}",
+            "price":f"KES {p}/{COMMODITY_DEFAULTS[com]['unit'].split('/')[1]}",
+            "cost":cost,"notes":ing["notes"]})
+    labour_cost=food_cost*labour_pct; fuel_cost=food_cost*recipe["firewood_fuel_share"]
+    total_cost=food_cost+labour_cost+fuel_cost
+    return {"key":meal_key,"label":recipe["label"],"desc":recipe["desc"],
+            "ingredients":ingredients,"food_cost":food_cost,"fuel_cost":fuel_cost,
+            "labour_cost":labour_cost,"total_cost":total_cost,"fuel_share":recipe["firewood_fuel_share"]}
 
+def compute_all_meals(served_meals, prices):
+    meals={}; daily=0.0
+    for k in served_meals:
+        m=compute_meal_cost(k,prices); meals[k]=m; daily+=m["total_cost"]
+    w=daily*DAYS_PER_WEEK; t=w*WEEKS_PER_TERM
+    return {"meals":meals,"daily":daily,"weekly":w,"term":t,"annual":t*TERMS_PER_YEAR}
 
-def calculate_costs(sizing: dict, fuel: str) -> dict:
-    alloc = sizing["pot_alloc"]; stoves = sizing["stoves_needed"]; sc = STOVE_COSTS[fuel]
-    stove_s = sum(sc[s]*c for s,c in alloc.items())
-    pot_s   = sum(POT_COSTS[s]*c for s,c in alloc.items())
-    infra_s = INFRA_COSTS[fuel]*stoves
-    equip   = stove_s + infra_s
-    inst    = int((equip + pot_s) * INSTALL_RATE[fuel])
-    grand   = equip + pot_s + inst
-    items = []
+def compute_clean_cook(fw):
+    cc_meals={}; daily=0.0
+    for k,m in fw["meals"].items():
+        nf=m["fuel_cost"]*(1-CLEAN_FUEL_SAVE); nt=m["food_cost"]+m["labour_cost"]+nf
+        cc_meals[k]={**m,"cc_fuel_cost":nf,"cc_total_cost":nt,"saving_per_day":m["total_cost"]-nt}
+        daily+=nt
+    w=daily*DAYS_PER_WEEK; t=w*WEEKS_PER_TERM
+    return {"meals":cc_meals,"daily":daily,"weekly":w,"term":t,"annual":t*TERMS_PER_YEAR,
+            "saving_daily":fw["daily"]-daily,"saving_weekly":fw["weekly"]-w,"saving_term":fw["term"]-t}
+
+STOVE_COSTS={"LPG":{200:35_000,100:22_000,50:14_000},"Electric":{200:55_000,100:38_000,50:22_000}}
+POT_COSTS={200:28_000,100:16_000,50:9_000}
+INFRA_COSTS={"LPG":18_000,"Electric":25_000}
+INSTALL_RATE={"LPG":0.15,"Electric":0.20}
+
+def calc_sizing(n,m):
+    total=n*m*5; alloc={}; rem=total
+    for sz in [200,100,50]:
+        cnt=int(rem//(sz*0.8))
+        if cnt>0: alloc[sz]=cnt; rem-=cnt*sz*0.8
+    if rem>0: alloc[50]=alloc.get(50,0)+1
+    tp=sum(alloc.values())
+    return {"total_litres":total,"pot_alloc":alloc,"total_pots":tp,"stoves":math.ceil(tp*1.2)}
+
+def calc_equip(sizing,fuel):
+    alloc=sizing["pot_alloc"]; stoves=sizing["stoves"]; sc=STOVE_COSTS[fuel]
+    sv=sum(sc[s]*c for s,c in alloc.items()); pv=sum(POT_COSTS[s]*c for s,c in alloc.items())
+    iv=INFRA_COSTS[fuel]*stoves; eq=sv+iv; inst=int((eq+pv)*INSTALL_RATE[fuel])
+    items=[]
     for s,c in sorted(alloc.items(),reverse=True):
-        lbl = "LPG burner" if fuel=="LPG" else "Induction cooker"
-        items.append({"item":f"{c}× {lbl} ({s}L)","total":sc[s]*c})
+        items.append({"item":f"{c}× {'LPG burner' if fuel=='LPG' else 'Induction'} ({s}L)","total":sc[s]*c})
     for s,c in sorted(alloc.items(),reverse=True):
-        items.append({"item":f"{c}× Stainless pot ({s}L)","total":POT_COSTS[s]*c})
-    items.append({"item":f"Infrastructure ({'cylinders+regulators' if fuel=='LPG' else '3-phase wiring'})","total":infra_s})
-    items.append({"item":f"Installation ({int(INSTALL_RATE[fuel]*100)}%)","total":inst})
-    return {"stove_s":stove_s,"pot_s":pot_s,"infra_s":infra_s,"equip":equip,"inst":inst,"grand":grand,"items":items}
+        items.append({"item":f"{c}× Pot ({s}L)","total":POT_COSTS[s]*c})
+    items.append({"item":"Infrastructure","total":iv})
+    items.append({"item":f"Install ({int(INSTALL_RATE[fuel]*100)}%)","total":inst})
+    return {"stove":sv,"pot":pv,"infra":iv,"equip":eq,"inst":inst,"grand":eq+pv+inst,"items":items}
+
+def calc_fw(n,fw_price,fw_kg):
+    d=fw_price*fw_kg; w=d*7; t=w*13; a=t*3
+    return {"daily":d,"weekly":w,"term":t,"annual":a,
+            "per_student_day":d/n if n else 0,"per_student_week":w/7/n if n else 0}
 
 
-# ─────────────────────────────────────────────────────────────
-# SESSION STATE INIT
-# ─────────────────────────────────────────────────────────────
-if "geo_confirmed" not in st.session_state:
-    st.session_state.geo_confirmed = False   # Has user confirmed a location?
-if "geo"           not in st.session_state:
-    st.session_state.geo = None              # Confirmed geo dict
-if "candidates"    not in st.session_state:
-    st.session_state.candidates = []         # Search result candidates
-if "search_query"  not in st.session_state:
-    st.session_state.search_query = ""
-if "chat_msgs"     not in st.session_state:
-    st.session_state.chat_msgs = []
+# ─── SESSION STATE ─────────────────────────────────────────────
+for k,v in [("geo_confirmed",False),("geo",None),("clicked_lat",None),
+             ("clicked_lng",None),("chat_msgs",[]),("geo_status",""),("geo_source","")]:
+    if k not in st.session_state: st.session_state[k]=v
 
 
-# ─────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────
+# ─── NOMINATIM GEOCODE (silent, no fallback, returns None if not found) ────
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOM_HEADERS   = {"User-Agent": "CleanCookApp/7.0 (school-energy-transition-kenya)"}
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def nominatim_geocode(query: str):
+    """
+    Query Nominatim for a single best result restricted to Kenya.
+    Returns (lat, lng, display_name) or None if nothing found.
+    Cached for 1 hour.
+    """
+    try:
+        r = requests.get(NOMINATIM_URL,
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "ke"},
+            headers=NOM_HEADERS, timeout=10)
+        r.raise_for_status()
+        results = r.json()
+        if results:
+            best = results[0]
+            return float(best["lat"]), float(best["lon"]), best.get("display_name", query)
+    except Exception:
+        pass
+    return None
+
+
+# ─── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ API Keys")
-    openai_key = st.text_input("OpenAI API Key", type="password",
-                               value=os.environ.get("OPENAI_API_KEY",""))
-    tavily_key = st.text_input("Tavily API Key", type="password",
-                               value=os.environ.get("TAVILY_API_KEY",""))
+    openai_key=st.text_input("OpenAI API Key",type="password",value=os.environ.get("OPENAI_API_KEY",""))
+    tavily_key=st.text_input("Tavily API Key", type="password",value=os.environ.get("TAVILY_API_KEY",""))
     st.divider()
 
     st.markdown("### 🏫 School Details")
-    school_name   = st.text_input("School Name", "Machakos High School")
-    county        = st.text_input("County / Region", "Machakos County")
-    num_students  = st.number_input("Number of Students", 10, 10000, 500, 10)
-    meals_per_day = st.selectbox("Meals per Day", [1,2,3], index=2)
-    fuel_type     = st.radio("Target Fuel Type", ["LPG","Electric"], horizontal=True)
-    budget_kes    = st.number_input("Available Budget (KES)", 0, 50_000_000, 0, 10000)
-
+    school_name  =st.text_input("School Name","Gitwe High School")
+    county       =st.text_input("County / Region","Kiambu County")
+    num_students =st.number_input("Number of Students",10,10000,500,10)
+    school_type  =st.selectbox("School Type",["Boarding","Day School","Day & Boarding"])
+    fuel_type    =st.radio("Target Fuel Type",["LPG","Electric"],horizontal=True)
+    budget_kes   =st.number_input("Available Budget (KES)",0,50_000_000,0,10000)
     st.divider()
 
-    # ── Geolocation section ──
-    st.markdown("### 📍 School Geolocation")
+    st.markdown("### 🔥 Current Cooking Method")
+    current_fuel=st.selectbox("Current method",["Firewood","Charcoal","Kerosene","LPG (partial)","Mixed"])
+    fw_price_kg =st.number_input("Firewood price (KES/kg)",1,200,5,1)
+    fw_kg_day   =st.number_input("Firewood used per day (kg)",10,5000,200,10)
+    st.divider()
 
-    # Show confirmed status
+    st.markdown("### 🍽️ Meals Served")
+    serve_bfast =st.checkbox("Breakfast",value=True)
+    serve_lunch =st.checkbox("Lunch",    value=True)
+    serve_supper=st.checkbox("Supper",   value=True)
+    served_meals=[k for k,v in [("breakfast",serve_bfast),("lunch",serve_lunch),("supper",serve_supper)] if v]
+    st.divider()
+
+    st.markdown("### 🛒 Commodity Prices")
+    st.caption("Pre-filled with Kenya 2025 market rates. Adjust for your region.")
+    prices={}
+    with st.expander("📦 Adjust prices for your area",expanded=False):
+        for key,meta in COMMODITY_DEFAULTS.items():
+            if meta["unit"]=="%":
+                prices[key]=st.slider(f"{meta['label']} ({meta['unit']})",5,40,meta["default"],1,
+                                      help=meta["desc"],key=f"price_{key}")
+            else:
+                prices[key]=st.number_input(f"{meta['label']} ({meta['unit']})",1,2000,meta["default"],1,
+                                            help=meta["desc"],key=f"price_{key}")
+    for key,meta in COMMODITY_DEFAULTS.items():
+        if key not in prices: prices[key]=meta["default"]
+    st.divider()
+
+    # ── Location status in sidebar ──
+    st.markdown("### 📍 School Location")
     if st.session_state.geo_confirmed and st.session_state.geo:
-        g = st.session_state.geo
+        g=st.session_state.geo
+        src_icon = "🌍" if st.session_state.geo_source == "geocoded" else "📌"
         st.markdown(
-            f'<div style="background:#e8f5ee;border:2px solid #1a6b3c;border-radius:8px;padding:10px 12px;font-size:.83rem;color:#1a4a2c">'
-            f'✅ <b>Confirmed</b><br>'
-            f'{g["display_name"][:65]}...<br>'
+            f'<div style="background:#e8f5ee;border:2px solid #1a6b3c;border-radius:8px;'
+            f'padding:10px 12px;font-size:.83rem;color:#1a4a2c">'
+            f'✅ <b>Location confirmed</b> {src_icon}<br>'
+            f'<span style="color:#555;font-size:.78rem">{g.get("display_name","")[:55]}...</span><br>'
             f'<span style="font-family:monospace">{g["lat"]:.5f}, {g["lng"]:.5f}</span>'
             f'</div>', unsafe_allow_html=True)
         st.markdown("")
         if st.button("🔄 Change Location", use_container_width=True):
-            st.session_state.geo_confirmed = False
-            st.session_state.geo = None
-            st.session_state.candidates = []
+            st.session_state.geo_confirmed=False
+            st.session_state.geo=None
+            st.session_state.clicked_lat=None
+            st.session_state.clicked_lng=None
+            st.session_state.geo_status=""
+            st.session_state.geo_source=""
             st.rerun()
     else:
-        st.caption("Search for your school to pin the exact location. No fallback — you confirm the correct pin.")
-        search_input = st.text_input(
-            "Search query",
-            value=f"{school_name}, {county}, Kenya",
-            placeholder="e.g. Machakos High School, Kenya",
-            key="geo_search_input"
-        )
-        search_btn = st.button("🔍 Search Location", type="primary", use_container_width=True)
-
-        if search_btn and search_input.strip():
-            with st.spinner("Searching OpenStreetMap..."):
-                st.session_state.candidates = search_nominatim(search_input.strip(), limit=5)
-                st.session_state.search_query = search_input.strip()
-
-        # Manual coordinate entry
-        with st.expander("📌 Enter coordinates manually"):
-            man_lat = st.number_input("Latitude",  value=-1.2921, format="%.5f", key="man_lat")
-            man_lng = st.number_input("Longitude", value=36.8219, format="%.5f", key="man_lng")
-            man_lbl = st.text_input("Label", value=school_name, key="man_lbl")
-            if st.button("✅ Use These Coordinates", use_container_width=True):
-                st.session_state.geo = {
-                    "lat": man_lat, "lng": man_lng,
-                    "display_name": f"{man_lbl} (manual entry)",
-                    "short_label": man_lbl,
-                    "type": "manual",
-                }
-                st.session_state.geo_confirmed = True
-                st.session_state.candidates = []
-                st.rerun()
+        st.caption("Geocode by name or drop a pin on the map.")
 
 
-# ─────────────────────────────────────────────────────────────
-# CANDIDATE PICKER — shown in main area when not confirmed
-# ─────────────────────────────────────────────────────────────
+# ─── LOCATION PICKER — blocks app until location confirmed ─────
 if not st.session_state.geo_confirmed:
-    st.markdown('<div class="main-title">🔥 CleanCook</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">School Energy Transition Platform</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="main-title">🔥 CleanCook</div>',unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">School Energy Transition Platform</div>',unsafe_allow_html=True)
     st.markdown("---")
 
-    candidates = st.session_state.candidates
+    # ── Step 1: Geocode by name ──────────────────────────────────
+    st.markdown("### 📍 Locate Your School")
 
-    if not candidates and not st.session_state.search_query:
-        # Fresh start — prompt the user
-        st.markdown("""
-<div class="geo-pending">
-<b>📍 Start by locating your school</b><br>
-Use the search box in the sidebar to find your school on the map.
-You will choose the exact location from search results — no guessing, no fallback.
-</div>
-""", unsafe_allow_html=True)
-
-        col_a, col_b = st.columns(2)
-        col_a.markdown("""
-**How it works:**
-1. Enter your school name and county in the sidebar
-2. Click **Search Location**
-3. Pick the correct result from the list
-4. Or enter exact lat/lng coordinates manually
-5. Once confirmed, the full app unlocks
-        """)
-        col_b.markdown("""
-**Tips for better results:**
-- Use the official registered school name
-- Add the county, e.g. *"St. Mary's Mumias, Kakamega"*
-- Try shorter versions if not found, e.g. *"Mumias High School"*
-- Check spelling — OpenStreetMap uses official names
-- Use manual coordinates as a last resort (from Google Maps)
-        """)
-
-    elif not candidates and st.session_state.search_query:
-        # Searched but nothing returned
-        st.error(
-            f"❌ No results found for **\"{st.session_state.search_query}\"** in Kenya on OpenStreetMap.\n\n"
-            "**Try:**\n"
-            "- A shorter version of the name (e.g. just the distinctive part)\n"
-            "- Remove 'Catholic' / 'High School' if it was added automatically\n"
-            "- Search just the town/area name to verify it exists in OSM\n"
-            "- Use the **manual coordinates** option in the sidebar (paste from Google Maps)"
+    col_gc, col_gc2 = st.columns([3, 1])
+    with col_gc:
+        geocode_query = st.text_input(
+            "School name & county",
+            value=f"{school_name}, {county}, Kenya",
+            placeholder="e.g. Gitwe High School, Kiambu, Kenya",
+            label_visibility="collapsed",
+            key="geocode_input",
         )
-        st.markdown('<div class="geo-search-hint">💡 <b>Getting coordinates from Google Maps:</b> Right-click any location on Google Maps → the coordinates appear at the top of the context menu. Copy and paste them into the manual entry box.</div>', unsafe_allow_html=True)
+    with col_gc2:
+        geocode_btn = st.button("🔍 Geocode", type="primary", use_container_width=True)
 
-    else:
-        # Show candidates for user to pick
-        st.markdown("### 📍 Select the correct location")
-        st.markdown(
-            f"Found **{len(candidates)} result(s)** for *\"{st.session_state.search_query}\"*. "
-            "Pick the one that matches your school:"
-        )
+    # Run geocode when button clicked
+    if geocode_btn and geocode_query.strip():
+        with st.spinner(f"Searching for \"{geocode_query.strip()}\"..."):
+            result = nominatim_geocode(geocode_query.strip())
+        if result:
+            lat_gc, lng_gc, display_gc = result
+            st.session_state.clicked_lat   = lat_gc
+            st.session_state.clicked_lng   = lng_gc
+            st.session_state.geo_status    = f"✅ Found: {display_gc[:90]}"
+            st.session_state.geo_source    = "geocoded"
+            st.rerun()
+        else:
+            st.session_state.geo_status = (
+                f"⚠️ Could not find **\"{geocode_query.strip()}\"** in Kenya via OpenStreetMap. "
+                f"Many Kenyan schools are not in OSM — please **click the map** to place your pin manually."
+            )
+            st.session_state.geo_source = ""
 
-        # Preview map showing all candidates
-        center_lat = sum(c["lat"] for c in candidates) / len(candidates)
-        center_lng = sum(c["lng"] for c in candidates) / len(candidates)
-        preview_map = folium.Map(location=[center_lat, center_lng], zoom_start=8,
-                                 tiles="CartoDB positron")
-        colors = ["green","blue","orange","red","purple"]
-        for i, cand in enumerate(candidates):
-            folium.Marker(
-                [cand["lat"], cand["lng"]],
-                tooltip=f"#{i+1} — {cand['short_label'][:50]}",
-                popup=folium.Popup(
-                    f"<b>#{i+1}</b><br>{cand['display_name'][:120]}<br>"
-                    f"<small>Lat: {cand['lat']:.5f}, Lng: {cand['lng']:.5f}</small>",
-                    max_width=250),
-                icon=folium.Icon(color=colors[i % len(colors)],
-                                 icon="map-marker", prefix="fa"),
-            ).add_to(preview_map)
-
-        col_map_prev, col_list = st.columns([2, 1])
-        with col_map_prev:
-            st_folium(preview_map, width=620, height=380)
-
-        with col_list:
-            st.markdown("**Choose your school:**")
-            for i, cand in enumerate(candidates):
-                type_label = cand.get("type", "place").replace("_", " ").title()
-                col_btn, col_info = st.columns([1, 4])
-                with col_info:
-                    st.markdown(
-                        f'<div class="candidate-card">'
-                        f'<div class="candidate-type">#{i+1} · {type_label}</div>'
-                        f'<div class="candidate-name">{cand["short_label"][:55]}</div>'
-                        f'<div class="candidate-addr">{cand["display_name"][: 80]}...</div>'
-                        f'<div class="candidate-coord">{cand["lat"]:.5f}, {cand["lng"]:.5f}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True
-                    )
-                with col_btn:
-                    if st.button(f"✅ #{i+1}", key=f"pick_{i}", use_container_width=True):
-                        st.session_state.geo = cand
-                        st.session_state.geo_confirmed = True
-                        st.session_state.candidates = []
-                        st.rerun()
-
-            st.markdown("---")
-            st.markdown("**None of these?**")
-            st.markdown("Use the **manual coordinates** option in the sidebar.")
-
-    st.stop()   # ← STOP rendering the rest of the app until location is confirmed
-
-
-# ─────────────────────────────────────────────────────────────
-# FROM HERE: location is confirmed — render full app
-# ─────────────────────────────────────────────────────────────
-geo     = st.session_state.geo
-lat     = geo["lat"]
-lng     = geo["lng"]
-sizing  = calculate_sizing(num_students, meals_per_day)
-costs   = calculate_costs(sizing, fuel_type)
-alt_fuel  = "Electric" if fuel_type == "LPG" else "LPG"
-costs_alt = calculate_costs(sizing, alt_fuel)
-
-# ─────────────────────────────────────────────────────────────
-# HEADER + METRICS
-# ─────────────────────────────────────────────────────────────
-st.markdown('<div class="main-title">🔥 CleanCook</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">School Energy Transition Platform — Size · Cost · Validate</div>',
-            unsafe_allow_html=True)
-st.markdown("---")
-
-m1, m2, m3, m4, m5 = st.columns(5)
-for col, val, lbl in [
-    (m1, f"{num_students:,}",                       "Students"),
-    (m2, f"{sizing['total_litres']:,}L",             "Litres / Day"),
-    (m3, str(sizing['stoves_needed']),                "Stoves Needed"),
-    (m4, f"KES {costs['grand']:,.0f}",               f"Est. Cost ({fuel_type})"),
-    (m5, f"KES {costs['grand']//num_students:,}",    "Cost / Student"),
-]:
-    col.markdown(
-        f'<div class="metric-card"><div class="metric-val">{val}</div>'
-        f'<div class="metric-lbl">{lbl}</div></div>', unsafe_allow_html=True)
-st.markdown("<br>", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# TABS
-# ─────────────────────────────────────────────────────────────
-tab_map, tab_size, tab_calc, tab_agent, tab_dd = st.tabs([
-    "🗺️  School Map",
-    "📐  Sizing & Costs",
-    "🧮  How Calculations Work",
-    "🤖  AI Agent",
-    "🔍  Due Diligence",
-])
-
-
-# ══════════════════════════════
-# TAB 1 — MAP
-# ══════════════════════════════
-with tab_map:
-    st.markdown('<div class="section-head">School Location & Energy Infrastructure</div>',
-                unsafe_allow_html=True)
+    # Show geocode status message
+    if st.session_state.geo_status:
+        if st.session_state.geo_status.startswith("✅"):
+            st.success(st.session_state.geo_status)
+        else:
+            st.warning(st.session_state.geo_status)
 
     st.markdown(
-        f'<div class="geo-confirmed">'
-        f'📍 <b>Confirmed location:</b> {geo["display_name"][:100]}<br>'
-        f'<span style="font-family:monospace;font-size:.82rem">'
-        f'Lat: {lat:.5f} | Lng: {lng:.5f}</span>'
-        f' &nbsp;·&nbsp; <a href="#" style="color:#1a6b3c">Change in sidebar</a>'
-        f'</div>',
-        unsafe_allow_html=True)
+        '<div class="pin-hint" style="margin-top:12px">'
+        '🗺️ <b>The pin appears on the map below.</b> '
+        'Geocoded schools are placed automatically. '
+        'If the pin is wrong or missing, <b>click directly on the map</b> to place it precisely. '
+        'Then click <b>Confirm Location</b>.'
+        '</div>', unsafe_allow_html=True)
 
-    col_map, col_leg = st.columns([3, 1])
-    with col_map:
-        m = folium.Map(location=[lat, lng], zoom_start=15, tiles="CartoDB positron")
+    # ── Map: show geocoded pin OR let user click ─────────────────
+    # Centre on Kenya, or zoom to existing pin
+    if st.session_state.clicked_lat:
+        picker_center = [st.session_state.clicked_lat, st.session_state.clicked_lng]
+        picker_zoom   = 15 if st.session_state.geo_source == "geocoded" else 14
+    else:
+        picker_center = [0.0236, 37.9062]   # Kenya centre
+        picker_zoom   = 6
 
-        # School pin — confirmed exact location
+    picker_map = folium.Map(location=picker_center, zoom_start=picker_zoom,
+                            tiles="CartoDB positron")
+
+    # Draw current pin
+    if st.session_state.clicked_lat:
+        pin_source = "Geocoded" if st.session_state.geo_source=="geocoded" else "Map click"
         folium.Marker(
-            [lat, lng],
+            [st.session_state.clicked_lat, st.session_state.clicked_lng],
+            tooltip=f"📍 {school_name} ({pin_source}) — click map to move",
             popup=folium.Popup(
                 f"<b>{school_name}</b><br>{county}<br>"
-                f"Students: {num_students:,}<br>Fuel: {fuel_type}<br>"
-                f"<small>{geo['display_name'][:80]}</small>",
-                max_width=240),
-            tooltip=f"📍 {school_name}",
-            icon=folium.Icon(color="green", icon="home", prefix="fa"),
-        ).add_to(m)
+                f"<small>{pin_source}</small><br>"
+                f"Lat: {st.session_state.clicked_lat:.5f}<br>"
+                f"Lng: {st.session_state.clicked_lng:.5f}",
+                max_width=220),
+            icon=folium.Icon(
+                color="green" if st.session_state.geo_source=="geocoded" else "orange",
+                icon="map-marker", prefix="fa"),
+        ).add_to(picker_map)
 
-        # Electricity substation ~2km N
-        sub = offset_coords(lat, lng, 2.0, 0)
-        folium.Marker(sub,
-            popup="⚡ Electricity Substation (estimated ~2km)",
-            tooltip="Substation",
-            icon=folium.Icon(color="blue", icon="bolt", prefix="fa")).add_to(m)
+    # Live cursor coordinates
+    MousePosition(
+        position="bottomleft", separator=" | ", prefix="Cursor:",
+        lat_formatter="function(num){return num.toFixed(5);}",
+        lng_formatter="function(num){return num.toFixed(5);}",
+    ).add_to(picker_map)
 
-        # Power line N–S corridor
-        folium.PolyLine(
-            [offset_coords(lat,lng,5,180), [lat,lng], offset_coords(lat,lng,5,0)],
-            color="#1a6bcc", weight=3, opacity=0.7,
-            tooltip="High-voltage power line (estimated corridor)").add_to(m)
-
-        # LPG depot ~3km E
-        lpg_pt = offset_coords(lat, lng, 3.0, 90)
-        folium.Marker(lpg_pt,
-            popup="🔵 LPG Supplier Depot (estimated ~3km east)",
-            tooltip="LPG Depot",
-            icon=folium.Icon(color="orange", icon="fire", prefix="fa")).add_to(m)
-
-        # Nearest town ~4km SW
-        town = offset_coords(lat, lng, 4.0, 225)
-        folium.Marker(town,
-            popup="🏘️ Nearest Town / Grid Node (estimated ~4km)",
-            tooltip="Town Centre",
-            icon=folium.Icon(color="red", icon="building", prefix="fa")).add_to(m)
-
-        # 5km infrastructure zone
-        folium.Circle([lat,lng], radius=5000, color="#1a6b3c",
-            fill=True, fill_opacity=0.05,
-            tooltip="5km infrastructure assessment zone").add_to(m)
-
-        folium.LayerControl().add_to(m)
-        st_folium(m, width=740, height=500)
-
-    with col_leg:
-        st.markdown("**Legend**")
+    col_map, col_side = st.columns([3, 1])
+    with col_map:
+        map_data = st_folium(picker_map, width=760, height=500,
+                             returned_objects=["last_clicked"],
+                             key="location_picker")
+    with col_side:
+        st.markdown("#### Steps")
         st.markdown(
-            "🟢 **School** — Confirmed pin  \n"
-            "🔵 **Substation** — Grid  \n"
-            "🟠 **LPG Depot**  \n"
-            "🔴 **Town** — Grid node  \n"
-            "🔵 **Line** — Power corridor  \n"
-            "⭕ **Circle** — 5km zone"
+            "**Option A — Geocode:**\n"
+            "1. Enter school name above\n"
+            "2. Click **Geocode**\n"
+            "3. Pin appears on map\n\n"
+            "**Option B — Click map:**\n"
+            "1. Zoom into school area\n"
+            "2. Click exact location\n"
+            "3. Orange pin appears\n\n"
+            "Then click **Confirm** ↓"
         )
-        st.divider()
-        st.markdown("**Location Source**")
-        src = geo.get("type","")
-        if src == "manual":
-            st.markdown("📌 Manually entered coordinates")
-        else:
-            st.markdown("🌍 OpenStreetMap Nominatim")
-            st.markdown(f"`{geo.get('type','place')}`")
-        st.divider()
-        st.markdown('<div class="warning-box">⚠️ Infrastructure markers are indicative. Run Due Diligence for verified utility data.</div>',
-                    unsafe_allow_html=True)
-
-
-# ══════════════════════════════
-# TAB 2 — SIZING & COSTS
-# ══════════════════════════════
-with tab_size:
-    st.markdown('<div class="section-head">Equipment Sizing & Cost Breakdown</div>', unsafe_allow_html=True)
-
-    col_s, col_c = st.columns(2)
-    with col_s:
-        st.markdown("#### 🍲 Pot Allocation")
-        st.caption(f"{num_students} × {meals_per_day} meals × 5L = **{sizing['total_litres']:,}L/day**")
-        for sz in sorted(sizing["pot_alloc"].keys(), reverse=True):
-            cnt = sizing["pot_alloc"][sz]
-            st.markdown(f"**{sz}L — {cnt} pot(s)**")
-            st.progress(min(cnt / 8, 1.0))
-        st.success(f"**{sizing['total_pots']} pots | {sizing['stoves_needed']} stoves** (incl. 20% buffer)")
-
-    with col_c:
-        st.markdown(f"#### 💰 Cost — {fuel_type}")
-        for item in costs["items"]:
-            c1, c2 = st.columns([3,1])
-            c1.markdown(item["item"])
-            c2.markdown(f"**KES {item['total']:,}**")
         st.markdown("---")
-        st.markdown(f"### TOTAL: **KES {costs['grand']:,}**")
-        st.markdown(f"Per student: **KES {costs['grand']//num_students:,}**")
-        if budget_kes > 0:
-            gap = costs["grand"] - budget_kes
-            st.error(f"⚠️ Shortfall: KES {gap:,}") if gap > 0 else st.success(f"✅ Surplus: KES {-gap:,}")
 
+        if st.session_state.clicked_lat:
+            src_label = "🌍 Geocoded" if st.session_state.geo_source=="geocoded" else "📌 Map click"
+            st.markdown(
+                f'<div class="pin-pending">'
+                f'<b>{src_label}</b><br>'
+                f'Lat: <code>{st.session_state.clicked_lat:.5f}</code><br>'
+                f'Lng: <code>{st.session_state.clicked_lng:.5f}</code>'
+                f'</div>', unsafe_allow_html=True)
+            st.markdown("")
+            if st.button("✅ Confirm Location", type="primary", use_container_width=True):
+                display = (st.session_state.geo_status.replace("✅ Found: ","")
+                           if st.session_state.geo_source=="geocoded"
+                           else f"{school_name}, {county} (map pin)")
+                st.session_state.geo = {
+                    "lat":          st.session_state.clicked_lat,
+                    "lng":          st.session_state.clicked_lng,
+                    "display_name": display,
+                    "type":         st.session_state.geo_source or "map_pin",
+                }
+                st.session_state.geo_confirmed = True
+                st.rerun()
+            if st.button("🗑️ Clear Pin", use_container_width=True):
+                st.session_state.clicked_lat=None
+                st.session_state.clicked_lng=None
+                st.session_state.geo_status=""
+                st.session_state.geo_source=""
+                st.rerun()
+        else:
+            st.info("No pin yet.\nGeocode above or click the map.")
+
+    # Capture manual map click
+    if map_data and map_data.get("last_clicked"):
+        new_lat = map_data["last_clicked"]["lat"]
+        new_lng = map_data["last_clicked"]["lng"]
+        if new_lat != st.session_state.clicked_lat or new_lng != st.session_state.clicked_lng:
+            st.session_state.clicked_lat = new_lat
+            st.session_state.clicked_lng = new_lng
+            st.session_state.geo_source  = "map_pin"
+            st.session_state.geo_status  = ""
+            st.rerun()
+
+    st.stop()
+
+
+# ─── CONFIRMED — compute everything ───────────────────────────
+geo=st.session_state.geo; lat,lng=geo["lat"],geo["lng"]
+fw_result =compute_all_meals(served_meals,prices)
+cc_result =compute_clean_cook(fw_result)
+sizing    =calc_sizing(num_students,max(len(served_meals),1))
+equip     =calc_equip(sizing,fuel_type)
+fw_costs  =calc_fw(num_students,fw_price_kg,fw_kg_day)
+amort_term   =equip["grand"]/(EQUIPMENT_LIFE*TERMS_PER_YEAR)
+amort_stu_t  =amort_term/num_students if num_students else 0
+fw_total_term=fw_result["term"]
+cc_total_term=cc_result["term"]+amort_stu_t
+saving_term  =fw_total_term-cc_total_term
+school_sv_t  =saving_term*num_students
+school_sv_yr =school_sv_t*TERMS_PER_YEAR
+
+
+# ─── HEADER + METRICS ─────────────────────────────────────────
+st.markdown('<div class="main-title">🔥 CleanCook</div>',unsafe_allow_html=True)
+st.markdown('<div class="subtitle">School Energy Transition Platform — Cost · Compare · Save</div>',unsafe_allow_html=True)
+st.markdown("---")
+m1,m2,m3,m4,m5=st.columns(5)
+for col,val,lbl,cls in [
+    (m1,f"{num_students:,}","Students",""),
+    (m2,f"KES {fw_result['term']:,.0f}","Meal Cost/Term (FW)","red"),
+    (m3,f"KES {fw_result['daily']:,.1f}","Daily Meal/Student","amber"),
+    (m4,f"KES {cc_result['daily']:,.1f}",f"Daily Meal ({fuel_type})","green"),
+    (m5,f"KES {max(saving_term,0):,.0f}","Saving/Student/Term","green"),
+]:
+    col.markdown(f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
+                 f'<div class="metric-lbl">{lbl}</div></div>',unsafe_allow_html=True)
+st.markdown("<br>",unsafe_allow_html=True)
+
+
+# ─── TABS ─────────────────────────────────────────────────────
+tab_savings,tab_meals,tab_fw,tab_map_t,tab_equip,tab_calc,tab_agent,tab_dd=st.tabs([
+    "💰  Savings Analysis","🍽️  Meal Breakdown","🪵  Firewood Costs",
+    "🗺️  School Map","📐  Equipment","🧮  Methodology","🤖  AI Agent","🔍  Due Diligence",
+])
+
+# ══ TAB 1 — SAVINGS ══════════════════════════════════════════
+with tab_savings:
+    st.markdown('<div class="section-head">💰 Firewood vs Clean Cooking — Full Comparison</div>',unsafe_allow_html=True)
+    if saving_term>0:
+        st.markdown(f'<div class="saving-banner"><div class="lbl">Saving per student per term</div>'
+                    f'<div class="big">KES {saving_term:,.0f}</div>'
+                    f'<div class="lbl" style="margin-top:8px">Whole school: <b>KES {school_sv_t:,.0f}/term</b> · <b>KES {school_sv_yr:,.0f}/year</b></div>'
+                    f'</div>',unsafe_allow_html=True)
+    else:
+        st.warning("Adjust commodity prices or firewood usage to see projected savings.")
+    c1,c2,c3=st.columns(3)
+    with c1:
+        st.markdown("**🪵 Firewood (Current)**")
+        for lbl,val in [("Daily meal cost",f"KES {fw_result['daily']:.1f}"),
+                        ("Weekly meal cost",f"KES {fw_result['weekly']:.0f}"),
+                        ("Per term",f"KES {fw_result['term']:.0f}"),
+                        ("Annual",f"KES {fw_result['annual']:.0f}")]:
+            st.markdown(f'<div class="cost-fw"><b>{val}</b><br><span style="font-size:.8rem;color:#7a1a1a">{lbl}</span></div>',unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"**🔵 {fuel_type} (Proposed)**")
+        for lbl,val in [("Daily meal cost",f"KES {cc_result['daily']:.1f}"),
+                        ("Weekly meal cost",f"KES {cc_result['weekly']:.0f}"),
+                        ("Per term (meals)",f"KES {cc_result['term']:.0f}"),
+                        ("+ Equipment amort",f"KES {amort_stu_t:.0f}"),
+                        ("Total/term",f"KES {cc_total_term:.0f}")]:
+            st.markdown(f'<div class="cost-cc"><b>{val}</b><br><span style="font-size:.8rem;color:#1a4a2c">{lbl}</span></div>',unsafe_allow_html=True)
+    with c3:
+        st.markdown("**✅ Savings**")
+        sv_cls="cost-cc" if saving_term>0 else "cost-neu"
+        for lbl,val in [("Saving/week/student",f"KES {cc_result['saving_weekly']:.0f}"),
+                        ("Saving/term/student",f"KES {saving_term:.0f}"),
+                        ("Saving/year/student",f"KES {saving_term*3:.0f}"),
+                        ("Whole school/term",f"KES {school_sv_t:,.0f}"),
+                        ("Whole school/year",f"KES {school_sv_yr:,.0f}")]:
+            st.markdown(f'<div class="{sv_cls}"><b>{val}</b><br><span style="font-size:.8rem">{lbl}</span></div>',unsafe_allow_html=True)
     st.divider()
-    st.markdown("#### ⚖️ LPG vs Electric Comparison")
-    c1, c2 = st.columns(2)
-    c1.metric(fuel_type,  f"KES {costs['grand']:,}",     f"KES {costs['grand']//num_students:,}/student")
-    c2.metric(alt_fuel,   f"KES {costs_alt['grand']:,}", f"KES {costs_alt['grand']//num_students:,}/student")
-    cheaper = fuel_type if costs["grand"] < costs_alt["grand"] else alt_fuel
-    st.info(f"💡 **{cheaper}** is cheaper by **KES {abs(costs['grand']-costs_alt['grand']):,}**.")
+    st.markdown("#### ⏱️ Payback & ROI")
+    p1,p2,p3=st.columns(3)
+    p1.metric("Equipment Investment",f"KES {equip['grand']:,}")
+    payback=equip["grand"]/school_sv_yr if school_sv_yr>0 else 0
+    p2.metric("Payback Period",f"{payback:.1f} years" if payback>0 else "N/A")
+    p3.metric("Equipment Life",f"{EQUIPMENT_LIFE} years")
+    if school_sv_yr>0:
+        lifetime=school_sv_yr*EQUIPMENT_LIFE-equip["grand"]
+        st.success(f"✅ Over {EQUIPMENT_LIFE} years: saves **KES {school_sv_yr*EQUIPMENT_LIFE:,.0f}** against **KES {equip['grand']:,}** investment — net gain **KES {max(lifetime,0):,.0f}**")
+    st.divider()
+    st.markdown("#### 📅 Weekly Cost Per Student — Meal by Meal")
+    hcols=st.columns(5)
+    for c,h in zip(hcols,["Meal","🪵 FW/week","🔵 CC/week","💚 Saving/wk","📅 Saving/term"]):
+        c.markdown(f"**{h}**")
+    for k,m in cc_result["meals"].items():
+        fw_w=m["total_cost"]*DAYS_PER_WEEK; cc_w=m["cc_total_cost"]*DAYS_PER_WEEK
+        sv_w=m["saving_per_day"]*DAYS_PER_WEEK; sv_t=sv_w*WEEKS_PER_TERM
+        row=st.columns(5)
+        row[0].markdown(m["label"])
+        row[1].markdown(f'<span style="color:#c0392b;font-weight:600">KES {fw_w:.0f}</span>',unsafe_allow_html=True)
+        row[2].markdown(f'<span style="color:#1a6b3c;font-weight:600">KES {cc_w:.0f}</span>',unsafe_allow_html=True)
+        row[3].markdown(f'<span style="color:#1a6b3c;font-weight:600">KES {sv_w:.0f}</span>',unsafe_allow_html=True)
+        row[4].markdown(f'<span style="color:#1a6b3c;font-weight:600">KES {sv_t:.0f}</span>',unsafe_allow_html=True)
 
+# ══ TAB 2 — MEAL BREAKDOWN ════════════════════════════════════
+with tab_meals:
+    st.markdown('<div class="section-head">🍽️ Meal Cost Breakdown — Kenya Ingredient Pricing</div>',unsafe_allow_html=True)
+    st.markdown("Costs estimated from commodity prices, not fixed assumptions. Each meal uses actual recipe gram quantities × current Kenya market rates.")
+    st.markdown('<div class="source-badge">📊 KIPPRA 2024: avg secondary meal = KES 38.93/day</div> '
+                '<div class="source-badge">🌾 FEWS NET 2024: maize ~KES 58/kg · beans ~KES 90/kg</div>',unsafe_allow_html=True)
+    st.markdown("")
+    if not served_meals:
+        st.warning("No meals selected. Enable meals in sidebar.")
+    else:
+        for k in served_meals:
+            fw_m=fw_result["meals"][k]; cc_m=cc_result["meals"][k]
+            st.markdown(f"### {fw_m['label']}")
+            st.caption(fw_m["desc"])
+            col_fw,col_cc=st.columns(2)
+            with col_fw:
+                st.markdown(f"**🪵 Firewood — KES {fw_m['total_cost']:.1f}/student/day**")
+                tbl={"Ingredient":[],"Qty":[],"Unit Price":[],"Cost (KES)":[]}
+                for ing in fw_m["ingredients"]:
+                    tbl["Ingredient"].append(ing["name"]); tbl["Qty"].append(ing["qty"])
+                    tbl["Unit Price"].append(ing["price"]); tbl["Cost (KES)"].append(f"{ing['cost']:.2f}")
+                st.table(tbl)
+                st.markdown(f'<div class="cost-fw">Food: KES {fw_m["food_cost"]:.1f} | '
+                            f'Fuel ({int(fw_m["fuel_share"]*100)}%): KES {fw_m["fuel_cost"]:.1f} | '
+                            f'Labour ({prices["labour_overhead_pct"]}%): KES {fw_m["labour_cost"]:.1f}</div>',unsafe_allow_html=True)
+            with col_cc:
+                st.markdown(f"**🔵 {fuel_type} — KES {cc_m['cc_total_cost']:.1f}/student/day**")
+                tbl2={"Ingredient":[],"FW Cost":[],"CC Cost":[],"Change":[]}
+                for ing in fw_m["ingredients"]:
+                    tbl2["Ingredient"].append(ing["name"])
+                    tbl2["FW Cost"].append(f"{ing['cost']:.2f}")
+                    tbl2["CC Cost"].append(f"{ing['cost']:.2f}")
+                    tbl2["Change"].append("—")
+                st.table(tbl2)
+                fuel_sv=fw_m["fuel_cost"]-cc_m["cc_fuel_cost"]
+                st.markdown(f'<div class="cost-cc">Food: KES {cc_m["food_cost"]:.1f} (unchanged) | '
+                            f'Fuel ({fuel_type}): KES {cc_m["cc_fuel_cost"]:.1f} | '
+                            f'Labour: KES {cc_m["labour_cost"]:.1f}<br>'
+                            f'<b>Fuel saving: KES {fuel_sv:.1f}/day ({int(CLEAN_FUEL_SAVE*100)}% reduction)</b></div>',unsafe_allow_html=True)
+            sv_d=cc_m["saving_per_day"]
+            st.markdown(f"**Daily saving:** KES {sv_d:.1f} → **Weekly:** KES {sv_d*DAYS_PER_WEEK:.0f} → **Term:** KES {sv_d*DAYS_PER_WEEK*WEEKS_PER_TERM:.0f}")
+            st.markdown("---")
+        st.markdown("#### 📋 Summary — Per Student")
+        hcols=st.columns(6)
+        for c,h in zip(hcols,["Meal","FW/day","CC/day","Save/day","Save/week","Save/term"]):
+            c.markdown(f"**{h}**")
+        for k,m in cc_result["meals"].items():
+            row=st.columns(6); row[0].markdown(m["label"])
+            row[1].markdown(f'<span style="color:#c0392b">KES {m["total_cost"]:.1f}</span>',unsafe_allow_html=True)
+            row[2].markdown(f'<span style="color:#1a6b3c">KES {m["cc_total_cost"]:.1f}</span>',unsafe_allow_html=True)
+            row[3].markdown(f'<span style="color:#1a6b3c">KES {m["saving_per_day"]:.1f}</span>',unsafe_allow_html=True)
+            row[4].markdown(f'<span style="color:#1a6b3c">KES {m["saving_per_day"]*DAYS_PER_WEEK:.0f}</span>',unsafe_allow_html=True)
+            row[5].markdown(f'<span style="color:#1a6b3c">KES {m["saving_per_day"]*DAYS_PER_WEEK*WEEKS_PER_TERM:.0f}</span>',unsafe_allow_html=True)
 
-# ══════════════════════════════
-# TAB 3 — HOW CALCULATIONS WORK
-# ══════════════════════════════
+# ══ TAB 3 — FIREWOOD COSTS ════════════════════════════════════
+with tab_fw:
+    st.markdown('<div class="section-head">🪵 Firewood Cost Analysis</div>',unsafe_allow_html=True)
+    st.markdown(f"Method: **{current_fuel}** · KES **{fw_price_kg}/kg** · **{fw_kg_day}kg/day**")
+    c1,c2=st.columns(2)
+    with c1:
+        st.markdown("#### 🏫 Whole School")
+        for lbl,val in [("Daily",fw_costs["daily"]),("Weekly",fw_costs["weekly"]),
+                        ("Term",fw_costs["term"]),("Annual",fw_costs["annual"])]:
+            st.markdown(f'<div class="cost-fw"><span style="font-size:.8rem;color:#7a1a1a">{lbl}</span><br><b style="font-size:1.1rem">KES {val:,.0f}</b></div>',unsafe_allow_html=True)
+    with c2:
+        st.markdown("#### 👤 Per Student (fuel only)")
+        for lbl,val in [("Per day",fw_costs["per_student_day"]),
+                        ("Per week",fw_costs["per_student_week"]),
+                        ("Per term",fw_costs["per_student_day"]*DAYS_PER_WEEK*WEEKS_PER_TERM)]:
+            st.markdown(f'<div class="cost-fw"><span style="font-size:.8rem;color:#7a1a1a">{lbl}</span><br><b style="font-size:1.1rem">KES {val:.1f}</b></div>',unsafe_allow_html=True)
+        st.metric("kg/term",f"{fw_kg_day*DAYS_PER_WEEK*WEEKS_PER_TERM:,}kg")
+        co2_yr=fw_kg_day*DAYS_PER_WEEK*WEEKS_PER_TERM*3*1.65
+        st.metric("CO₂/year",f"{co2_yr/1000:.1f} tonnes",help="IPCC: 1.65 kg CO₂/kg firewood")
+    st.divider()
+    c1,c2,c3=st.columns(3)
+    c1.metric("Firewood fuel/term",f"KES {fw_costs['term']:,.0f}")
+    cc_fuel_t=sum(m["cc_fuel_cost"] for m in cc_result["meals"].values())*DAYS_PER_WEEK*WEEKS_PER_TERM*num_students
+    fw_fuel_t=sum(m["fuel_cost"] for m in fw_result["meals"].values())*DAYS_PER_WEEK*WEEKS_PER_TERM*num_students
+    c2.metric(f"{fuel_type} fuel/term",f"KES {cc_fuel_t:,.0f}",delta=f"-KES {fw_fuel_t-cc_fuel_t:,.0f}")
+    c3.metric("Fuel saving/term",f"KES {fw_fuel_t-cc_fuel_t:,.0f}",
+              delta=f"{int((fw_fuel_t-cc_fuel_t)/fw_fuel_t*100)}% less" if fw_fuel_t>0 else "")
+
+# ══ TAB 4 — MAP ═══════════════════════════════════════════════
+with tab_map_t:
+    st.markdown('<div class="section-head">School Location & Energy Infrastructure</div>',unsafe_allow_html=True)
+    st.markdown(f'<div class="geo-confirmed">📍 <b>Pinned location:</b> {school_name}, {county}<br>'
+                f'<span style="font-family:monospace;font-size:.82rem">Lat: {lat:.5f} | Lng: {lng:.5f}</span>'
+                f'</div>',unsafe_allow_html=True)
+    cm,cl=st.columns([3,1])
+    with cm:
+        fmap=folium.Map(location=[lat,lng],zoom_start=15,tiles="CartoDB positron")
+        folium.Marker([lat,lng],
+            popup=folium.Popup(f"<b>{school_name}</b><br>{county}<br>Students: {num_students:,}<br>"
+                               f"Current: {current_fuel}<br>Target: {fuel_type}",max_width=220),
+            tooltip=f"📍 {school_name}",icon=folium.Icon(color="green",icon="home",prefix="fa")).add_to(fmap)
+        sub=offset_coords(lat,lng,2.0,0)
+        folium.Marker(sub,popup="⚡ Substation (~2km)",tooltip="Substation",
+            icon=folium.Icon(color="blue",icon="bolt",prefix="fa")).add_to(fmap)
+        folium.PolyLine([offset_coords(lat,lng,5,180),[lat,lng],offset_coords(lat,lng,5,0)],
+            color="#1a6bcc",weight=3,opacity=0.7,tooltip="Power line corridor").add_to(fmap)
+        lpg_pt=offset_coords(lat,lng,3.0,90)
+        folium.Marker(lpg_pt,popup="🔵 LPG Depot (~3km)",tooltip="LPG Depot",
+            icon=folium.Icon(color="orange",icon="fire",prefix="fa")).add_to(fmap)
+        town=offset_coords(lat,lng,4.0,225)
+        folium.Marker(town,popup="🏘️ Town (~4km)",tooltip="Town",
+            icon=folium.Icon(color="red",icon="building",prefix="fa")).add_to(fmap)
+        folium.Circle([lat,lng],radius=5000,color="#1a6b3c",fill=True,fill_opacity=0.05,tooltip="5km zone").add_to(fmap)
+        folium.LayerControl().add_to(fmap)
+        st_folium(fmap,width=740,height=500)
+    with cl:
+        st.markdown("**Legend**")
+        st.markdown("🟢 School (your pin)  \n🔵 Substation  \n🟠 LPG Depot  \n🔴 Town  \n🔵 Power line  \n⭕ 5km zone")
+        st.divider()
+        st.markdown("**Location method**")
+        st.markdown("📌 User-placed map pin")
+        st.markdown(f"Lat: `{lat:.5f}`  \nLng: `{lng:.5f}`")
+        st.divider()
+        st.markdown('<div class="warning-box">⚠️ Infrastructure markers are indicative. Run Due Diligence for verified utility data.</div>',unsafe_allow_html=True)
+
+# ══ TAB 5 — EQUIPMENT ════════════════════════════════════════
+with tab_equip:
+    st.markdown('<div class="section-head">📐 Equipment Sizing & Cost</div>',unsafe_allow_html=True)
+    cs,cc2=st.columns(2)
+    with cs:
+        st.markdown("#### 🍲 Pot Allocation")
+        st.caption(f"{num_students} × {max(len(served_meals),1)} meals × 5L = {sizing['total_litres']:,}L/day")
+        for sz in sorted(sizing["pot_alloc"].keys(),reverse=True):
+            cnt=sizing["pot_alloc"][sz]
+            st.markdown(f"**{sz}L — {cnt} pot(s)**"); st.progress(min(cnt/8,1.0))
+        st.success(f"{sizing['total_pots']} pots | {sizing['stoves']} stoves (+20% buffer)")
+    with cc2:
+        st.markdown(f"#### 💰 Cost — {fuel_type}")
+        for item in equip["items"]:
+            ca2,cb2=st.columns([3,1]); ca2.markdown(item["item"]); cb2.markdown(f"**KES {item['total']:,}**")
+        st.markdown("---")
+        st.markdown(f"### KES {equip['grand']:,}")
+        st.caption(f"Amortised: **KES {amort_term:,.0f}/term** · **KES {amort_stu_t:.0f}/student/term**")
+    st.divider()
+    ca2,cb2=st.columns(2)
+    lpg_eq=calc_equip(sizing,"LPG"); elec_eq=calc_equip(sizing,"Electric")
+    ca2.metric("LPG Equipment",f"KES {lpg_eq['grand']:,}")
+    cb2.metric("Electric Equipment",f"KES {elec_eq['grand']:,}")
+    cheaper="LPG" if lpg_eq["grand"]<elec_eq["grand"] else "Electric"
+    st.info(f"💡 **{cheaper}** is cheaper by KES {abs(lpg_eq['grand']-elec_eq['grand']):,}")
+
+# ══ TAB 6 — METHODOLOGY ══════════════════════════════════════
 with tab_calc:
-    st.markdown('<div class="section-head">🧮 How the Calculations Work</div>', unsafe_allow_html=True)
-    st.markdown("Every number in CleanCook comes from a documented formula. This tab explains each step.")
-
-    st.markdown("### 📏 Step 1 — Daily Cooking Volume")
-    st.markdown('<div class="calc-step"><b>Goal:</b> Determine total litres needed per day.<br><b>Benchmark:</b> Machakos High School (1×1000L + 1×500L + 3×200L pots for ~800 students, 3 meals/day) → 5L per student per meal.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="calc-formula">Total Litres/Day  =  Students × Meals/Day × 5L</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="calc-example">📌 Your school: {num_students:,} × {meals_per_day} × 5 = <b>{sizing["total_litres"]:,}L/day</b></div>', unsafe_allow_html=True)
-
+    st.markdown('<div class="section-head">🧮 Methodology & Data Sources</div>',unsafe_allow_html=True)
+    st.markdown("### 🥣 How Meal Costs Are Estimated")
+    st.markdown('<div class="calc-step"><b>No fixed price assumptions.</b> Each meal uses real recipe gram quantities × commodity prices. Formula: <code>Ingredient cost = (grams/1000) × price/kg</code>. Labour (20%) and firewood fuel (10-22% by meal) added separately.</div>',unsafe_allow_html=True)
+    for k in ["breakfast","lunch","supper"]:
+        with st.expander(f"{MEAL_RECIPES[k]['label']} — {MEAL_RECIPES[k]['desc']}"):
+            tbl={"Ingredient":[],"Qty":[],"Commodity":[]};
+            for ing in MEAL_RECIPES[k]["ingredients"]:
+                tbl["Ingredient"].append(COMMODITY_DEFAULTS[ing["commodity"]]["label"])
+                tbl["Qty"].append(f"{ing['grams']}{'ml' if '_L' in ing['commodity'] else 'g'}")
+                tbl["Commodity"].append(ing["commodity"])
+            st.table(tbl)
+            m=fw_result["meals"].get(k)
+            if m: st.markdown(f"**Calculated: KES {m['total_cost']:.2f}/student/day** (food: {m['food_cost']:.2f} + fuel: {m['fuel_cost']:.2f} + labour: {m['labour_cost']:.2f})")
     st.divider()
-    st.markdown("### 🍲 Step 2 — Pot Size Allocation")
-    st.markdown('<div class="calc-step"><b>Goal:</b> Assign 200L → 100L → 50L pots to meet daily volume.<br><b>80% fill rule:</b> Pots must not be brim-filled — liquid expands when cooking. Industry standard is 80% max.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="calc-formula">Usable capacity = Pot Size × 0.80\nPots of 200L    = floor(Total Litres ÷ 160)\nRemainder       → repeat for 100L, then 50L</div>', unsafe_allow_html=True)
-    alloc_str = " + ".join(f"{c}×{s}L" for s,c in sorted(sizing["pot_alloc"].items(),reverse=True))
-    st.markdown(f'<div class="calc-example">📌 Your school: {alloc_str} = <b>{sizing["total_pots"]} pots</b></div>', unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("### 🔥 Step 3 — Number of Stoves")
-    st.markdown('<div class="calc-step"><b>Goal:</b> Stoves needed including 20% operational spare capacity for breakdowns and maintenance.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="calc-formula">Stoves = ceil(Total Pots × 1.20)</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="calc-example">📌 Your school: ceil({sizing["total_pots"]} × 1.20) = <b>{sizing["stoves_needed"]} stoves</b></div>', unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("### 💰 Step 4 — Cost Estimation")
-    st.markdown('<div class="calc-step"><b>Prices:</b> Kenya market rates 2024–25. Electric costs more due to 3-phase power requirements (KPLC licensed installation).</div>', unsafe_allow_html=True)
-    col_t1, col_t2, col_t3 = st.columns(3)
-    col_t1.markdown("**LPG Stoves**"); col_t1.table({"Size":["200L","100L","50L"],"KES":["35,000","22,000","14,000"]})
-    col_t2.markdown("**Electric**"); col_t2.table({"Size":["200L","100L","50L"],"KES":["55,000","38,000","22,000"]})
-    col_t3.markdown("**Pots**"); col_t3.table({"Size":["200L","100L","50L"],"KES":["28,000","16,000","9,000"]})
-    st.markdown('<div class="calc-formula">Equipment = Σ(stove × qty) + infrastructure/stove\nPots      = Σ(pot × qty)\nInstall   = (Equipment + Pots) × 15%(LPG) or 20%(Electric)\nTOTAL     = Equipment + Pots + Install</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="calc-example">📌 Your school ({fuel_type}): Equipment KES {costs["equip"]:,} + Pots KES {costs["pot_s"]:,} + Install KES {costs["inst"]:,} = <b>KES {costs["grand"]:,}</b></div>', unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("### 📍 Step 5 — School Geolocation")
-    st.markdown('<div class="calc-step"><b>How it works:</b> You searched OpenStreetMap Nominatim and selected a result. No automatic fallback — you confirmed the exact pin.</div>', unsafe_allow_html=True)
-    src_type = "Manual coordinates" if geo.get("type")=="manual" else "OpenStreetMap Nominatim"
-    st.markdown(f'<div class="calc-example">📌 Source: {src_type}<br>Location: {geo["display_name"][:100]}<br>Coordinates: {lat:.5f}, {lng:.5f}</div>', unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("### 📋 Assumptions Summary")
+    st.markdown("### 📊 Data Sources")
     st.table({
-        "Parameter":  ["Litres/student/meal","Pot fill limit","Stove buffer","LPG infra","Electric infra","LPG install","Electric install"],
-        "Value":      ["5L","80%","+20%","KES 18k/stove","KES 25k/stove","15%","20%"],
-        "Source":     ["Machakos benchmark","Boil-over safety","Operational continuity","Cylinders+regulators","3-phase wiring+panel","Gas fitting","Licensed electrician"],
+        "Item":["Avg secondary meal","Firewood fuel (lunch)","Clean cooking saving","CO₂/kg firewood","Maize flour","Beans","School calendar"],
+        "Value":["KES 38.93/day","22% of food cost","40% reduction","1.65 kg CO₂/kg","~KES 58/kg","~KES 90/kg","3 terms × 13 weeks"],
+        "Source":["KIPPRA 2024","Institutional catering","Kenya REA","IPCC","FEWS NET 2024","FEWS NET 2024","Kenya MoE"],
     })
+    st.divider()
+    st.markdown("### 📍 Geolocation Method")
+    st.markdown('<div class="calc-step"><b>User-placed map pin.</b> No external geocoding API. No OSM search. The user zooms in on the interactive Kenya map and clicks their school\'s exact location. Works for any school, anywhere in Kenya.</div>',unsafe_allow_html=True)
 
-
-# ══════════════════════════════
-# TAB 4 — AI AGENT
-# ══════════════════════════════
+# ══ TAB 7 — AI AGENT ══════════════════════════════════════════
 with tab_agent:
-    st.markdown('<div class="section-head">🤖 CleanCook AI Agent</div>', unsafe_allow_html=True)
-
+    st.markdown('<div class="section-head">🤖 CleanCook AI Agent</div>',unsafe_allow_html=True)
     if not openai_key:
-        st.warning("⚠️ Enter your OpenAI API key in the sidebar.")
+        st.warning("⚠️ Enter OpenAI API key in sidebar.")
     else:
         @tool
-        def size_cooking_equipment_tool(num_students: int, meals_per_day: int = 3) -> str:
-            """Calculate recommended pot sizes for a school.
-            Args:
-                num_students: Total number of students.
-                meals_per_day: Meals cooked per day (1, 2, or 3).
-            """
-            s = calculate_sizing(num_students, meals_per_day)
-            lines = [f"Total litres/day: {s['total_litres']:,}", "Pot allocation:"]
-            for sz, cnt in sorted(s["pot_alloc"].items(), reverse=True):
-                lines.append(f"  {cnt}× {sz}L")
-            lines += [f"Total pots: {s['total_pots']}", f"Stoves (+20% buffer): {s['stoves_needed']}"]
+        def get_meal_costs_tool(meal: str) -> str:
+            """Get ingredient-level cost for a specific meal (breakfast, lunch, or supper)."""
+            if meal not in fw_result["meals"]:
+                return f"Meal not found. Available: {list(fw_result['meals'].keys())}"
+            m=fw_result["meals"][meal]; cc=cc_result["meals"][meal]
+            lines=[f"{m['label']} — KES {m['total_cost']:.2f}/student/day","Ingredients:"]
+            for ing in m["ingredients"]: lines.append(f"  {ing['name']}: {ing['qty']} = KES {ing['cost']:.2f}")
+            lines+=[f"Fuel: KES {m['fuel_cost']:.2f} | Labour: KES {m['labour_cost']:.2f}",
+                    f"With {fuel_type}: KES {cc['cc_total_cost']:.2f}/day | Saving: KES {cc['saving_per_day']:.2f}/day"]
             return "\n".join(lines)
 
         @tool
-        def estimate_transition_cost_tool(num_students: int, fuel_type: str, meals_per_day: int = 3) -> str:
-            """Estimate KES cost to transition a school from firewood to clean cooking.
-            Args:
-                num_students: Number of students.
-                fuel_type: 'LPG' or 'Electric'.
-                meals_per_day: Meals per day (1-3).
-            """
-            fuel = "LPG" if "lpg" in fuel_type.lower() else "Electric"
-            s = calculate_sizing(num_students, meals_per_day)
-            c = calculate_costs(s, fuel)
-            return (f"Fuel: {fuel}\nEquipment: KES {c['equip']:,}\nPots: KES {c['pot_s']:,}\n"
-                    f"Installation: KES {c['inst']:,}\nTOTAL: KES {c['grand']:,} (KES {c['grand']//num_students:,}/student)")
+        def get_savings_summary_tool() -> str:
+            """Full firewood vs clean cooking savings for this school."""
+            return (f"{school_name}, {county} — {num_students} students\n"
+                    f"FW meal/student/day: KES {fw_result['daily']:.1f}\n"
+                    f"FW meal/student/term: KES {fw_result['term']:.0f}\n"
+                    f"{fuel_type} meal/student/term: KES {cc_result['term']:.0f}\n"
+                    f"Equipment amort/student/term: KES {amort_stu_t:.0f}\n"
+                    f"NET saving/student/term: KES {saving_term:.0f}\n"
+                    f"Whole school saving/year: KES {school_sv_yr:,.0f}\n"
+                    f"Payback: {equip['grand']/(school_sv_yr if school_sv_yr>0 else 1):.1f} years")
 
         @tool
-        def compare_fuel_options_tool(num_students: int, meals_per_day: int = 3) -> str:
-            """Compare LPG vs Electric transition costs side by side.
-            Args:
-                num_students: Number of students.
-                meals_per_day: Meals per day.
-            """
-            s = calculate_sizing(num_students, meals_per_day)
-            lpg  = calculate_costs(s, "LPG")
-            elec = calculate_costs(s, "Electric")
-            cheaper = "LPG" if lpg["grand"] < elec["grand"] else "Electric"
-            return (f"LPG:      KES {lpg['grand']:,} ({lpg['grand']//num_students:,}/student)\n"
-                    f"Electric: KES {elec['grand']:,} ({elec['grand']//num_students:,}/student)\n"
-                    f"Cheaper: {cheaper} by KES {abs(lpg['grand']-elec['grand']):,}")
+        def get_firewood_costs_tool() -> str:
+            """Firewood cost breakdown for the school."""
+            return (f"KES {fw_price_kg}/kg × {fw_kg_day}kg/day\n"
+                    f"Daily: KES {fw_costs['daily']:,.0f}\nWeekly: KES {fw_costs['weekly']:,.0f}\n"
+                    f"Term: KES {fw_costs['term']:,.0f}\nAnnual: KES {fw_costs['annual']:,.0f}")
 
         @tool
-        def get_benchmark_data_tool() -> str:
-            """Return the Machakos High School benchmark used for sizing."""
-            return "Machakos High School: 1×1000L + 1×500L + 3×200L pots → 5L/student/meal baseline."
+        def get_equipment_tool() -> str:
+            """Equipment sizing and cost."""
+            s=calc_sizing(num_students,max(len(served_meals),1)); e=calc_equip(s,fuel_type)
+            lines=[f"Daily litres: {s['total_litres']:,}L","Pots:"]
+            for sz,cnt in sorted(s["pot_alloc"].items(),reverse=True): lines.append(f"  {cnt}× {sz}L")
+            lines+=[f"Stoves: {s['stoves']}",f"Total: KES {e['grand']:,}",
+                    f"Amortised: KES {e['grand']/(EQUIPMENT_LIFE*TERMS_PER_YEAR*num_students):.0f}/student/term"]
+            return "\n".join(lines)
 
-        agent_tools = [size_cooking_equipment_tool, estimate_transition_cost_tool,
-                       compare_fuel_options_tool, get_benchmark_data_tool]
+        agent_tools=[get_meal_costs_tool,get_savings_summary_tool,get_firewood_costs_tool,get_equipment_tool]
         if tavily_key:
-            os.environ["TAVILY_API_KEY"] = tavily_key
-            agent_tools.append(TavilySearch(max_results=5, topic="general"))
-
-        os.environ["OPENAI_API_KEY"] = openai_key
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.1, openai_api_key=openai_key)
-        agent = create_agent(llm, agent_tools,
-            system_prompt=(
-                f"You are CleanCook, helping {school_name} in {county}, Kenya "
-                f"transition from firewood to {fuel_type} cooking for {num_students} students "
-                f"({meals_per_day} meals/day). All costs in KES. Be concise and practical."
-            ), name="cleancook_agent")
-
+            os.environ["TAVILY_API_KEY"]=tavily_key
+            agent_tools.append(TavilySearch(max_results=5,topic="general"))
+        os.environ["OPENAI_API_KEY"]=openai_key
+        llm=ChatOpenAI(model="gpt-4o",temperature=0.1,openai_api_key=openai_key)
+        agent=create_agent(llm,agent_tools,
+            system_prompt=(f"You are CleanCook, helping {school_name} ({num_students} students, {county}, Kenya) "
+                           f"transition from {current_fuel} to {fuel_type}. "
+                           f"Meals: {', '.join(served_meals)}. Firewood: KES {fw_price_kg}/kg, {fw_kg_day}kg/day. "
+                           f"Meal costs are estimated from Kenya commodity prices (KIPPRA 2024). Be specific, use KES."),
+            name="cleancook_agent")
         for msg in st.session_state.chat_msgs:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        c1, c2, c3 = st.columns(3)
-        for col, sug in zip([c1,c2,c3], [
-            f"Size equipment for {num_students} students",
-            f"What will {fuel_type} transition cost?",
-            "Compare LPG vs Electric"
-        ]):
-            if col.button(sug):
-                st.session_state.pending = sug
-
-        prompt = st.chat_input("Ask CleanCook anything...")
-        if not prompt and "pending" in st.session_state:
-            prompt = st.session_state.pop("pending")
+            with st.chat_message(msg["role"]): st.markdown(msg["content"])
+        c1,c2,c3=st.columns(3)
+        for col,sug in zip([c1,c2,c3],["What does lunch cost per student?",
+                                        f"How much do we save switching to {fuel_type}?",
+                                        "What are our firewood costs per term?"]):
+            if col.button(sug,key=f"sug_{sug[:8]}"): st.session_state.pending=sug
+        prompt=st.chat_input("Ask CleanCook anything...")
+        if not prompt and "pending" in st.session_state: prompt=st.session_state.pop("pending")
         if prompt:
             st.session_state.chat_msgs.append({"role":"user","content":prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
+            with st.chat_message("user"): st.markdown(prompt)
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
-                        result = agent.invoke({"messages":[{"role":"user","content":prompt}]})
-                        response = result["messages"][-1].content
-                    except Exception as e:
-                        response = f"⚠️ Error: {e}"
+                        res=agent.invoke({"messages":[{"role":"user","content":prompt}]})
+                        response=res["messages"][-1].content
+                    except Exception as e: response=f"⚠️ Error: {e}"
                 st.markdown(response)
                 st.session_state.chat_msgs.append({"role":"assistant","content":response})
-        if st.button("🗑️ Clear Chat"):
-            st.session_state.chat_msgs = []
-            st.rerun()
+        if st.button("🗑️ Clear Chat"): st.session_state.chat_msgs=[]; st.rerun()
 
-
-# ══════════════════════════════
-# TAB 5 — DUE DILIGENCE
-# ══════════════════════════════
+# ══ TAB 8 — DUE DILIGENCE ════════════════════════════════════
 with tab_dd:
-    st.markdown('<div class="section-head">🔍 Due Diligence Report</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head">🔍 Due Diligence Report</div>',unsafe_allow_html=True)
     st.markdown(f"Live Tavily research on **{school_name}**, **{county}**.")
-
-    if not tavily_key:
-        st.warning("⚠️ Enter your Tavily API key in the sidebar.")
-    elif not openai_key:
-        st.warning("⚠️ Enter your OpenAI API key for the AI summary.")
+    if not tavily_key: st.warning("⚠️ Enter Tavily API key in sidebar.")
+    elif not openai_key: st.warning("⚠️ Enter OpenAI API key for AI summary.")
     else:
-        if st.button("🚀 Run Full Due Diligence", type="primary"):
-            os.environ["TAVILY_API_KEY"] = tavily_key
-            os.environ["OPENAI_API_KEY"] = openai_key
-            tavily = TavilySearch(max_results=5, topic="general", search_depth="advanced", include_answer=True)
-            queries = [
-                (f"{school_name} {county} Kenya Catholic school",           "🏫 School Background"),
-                (f"electricity grid access {county} Kenya rural schools",   "⚡ Electricity Infrastructure"),
-                (f"LPG suppliers distributors {county} Kenya",              "🔵 LPG Availability"),
-                (f"clean cooking LPG schools Kenya programme",              "🌍 Clean Cooking Programmes"),
-                (f"KPLC Kenya Power grid expansion {county}",              "🔌 Grid Expansion Plans"),
-            ]
-            dd_data = {}
-            prog = st.progress(0)
-            for i, (q, section) in enumerate(queries):
+        if st.button("🚀 Run Full Due Diligence",type="primary"):
+            os.environ["TAVILY_API_KEY"]=tavily_key; os.environ["OPENAI_API_KEY"]=openai_key
+            tav=TavilySearch(max_results=5,topic="general",search_depth="advanced",include_answer=True)
+            queries=[(f"{school_name} {county} Kenya school","🏫 School Background"),
+                     (f"electricity grid access {county} Kenya","⚡ Electricity Grid"),
+                     (f"LPG suppliers {county} Kenya","🔵 LPG Availability"),
+                     (f"clean cooking LPG schools Kenya","🌍 Clean Cooking"),
+                     (f"firewood cost Kenya {county}","🪵 Firewood Market")]
+            dd={}; prog=st.progress(0)
+            for i,(q,sec) in enumerate(queries):
                 try:
-                    raw = tavily.invoke({"query": q})
-                    dd_data[section] = json.loads(raw) if isinstance(raw, str) else raw
-                except Exception as e:
-                    dd_data[section] = {"error": str(e)}
+                    raw=tav.invoke({"query":q}); dd[sec]=json.loads(raw) if isinstance(raw,str) else raw
+                except Exception as e: dd[sec]={"error":str(e)}
                 prog.progress((i+1)/len(queries))
-
-            st.markdown(f"## Report: {school_name} — {county}")
-            st.divider()
-            for section, data in dd_data.items():
-                st.markdown(f"### {section}")
-                if "error" in data:
-                    st.error(f"Error: {data['error']}"); continue
+            st.markdown(f"## Report: {school_name}"); st.divider()
+            for sec,data in dd.items():
+                st.markdown(f"### {sec}")
+                if "error" in data: st.error(data["error"]); continue
                 if data.get("answer"):
-                    st.markdown(f'<div class="dd-card"><b>Summary:</b> {data["answer"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="dd-card"><b>Summary:</b> {data["answer"]}</div>',unsafe_allow_html=True)
                 for r in data.get("results",[])[:3]:
-                    snip = r.get("content","")[:300]
+                    snip=r.get("content","")[:280]
                     if snip:
-                        st.markdown(
-                            f'<div class="dd-card"><b>{r.get("title","")}</b><br>{snip}...'
-                            f'<div class="dd-source">🔗 <a href="{r.get("url","")}" target="_blank">{r.get("url","")}</a>'
-                            f' | Score: {r.get("score",0):.2f}</div></div>',
-                            unsafe_allow_html=True)
-
-            st.divider()
-            st.markdown("### 🤖 AI Summary")
-            with st.spinner("Generating recommendation..."):
+                        st.markdown(f'<div class="dd-card"><b>{r.get("title","")}</b><br>{snip}...'
+                                    f'<div class="dd-source">🔗 <a href="{r.get("url","")}" target="_blank">{r.get("url","")}</a>'
+                                    f' | Score: {r.get("score",0):.2f}</div></div>',unsafe_allow_html=True)
+            st.divider(); st.markdown("### 🤖 AI Summary")
+            with st.spinner("Generating..."):
                 try:
-                    ctx = "\n".join(
-                        f"{sec}: " + " | ".join(r.get("content","")[:150] for r in data.get("results",[])[:2])
-                        for sec, data in dd_data.items() if "error" not in data)
-                    llm_dd = ChatOpenAI(model="gpt-4o", temperature=0.1, openai_api_key=openai_key)
-                    summary = llm_dd.invoke(
-                        f"Due diligence for {school_name}, {county}, Kenya. "
-                        f"{fuel_type} transition for {num_students} students.\n\n{ctx}\n\n"
-                        f"Write 6-8 bullet points: school viability, grid access, LPG supply, "
-                        f"risks, recommendation (LPG/Electric/hybrid). Kenya context.")
+                    ctx="\n".join(f"{s}: "+" | ".join(r.get("content","")[:150] for r in d.get("results",[])[:2])
+                        for s,d in dd.items() if "error" not in d)
+                    llm_dd=ChatOpenAI(model="gpt-4o",temperature=0.1,openai_api_key=openai_key)
+                    summary=llm_dd.invoke(f"Due diligence for {school_name}, {county}. {fuel_type} transition. "
+                        f"{num_students} students. {current_fuel} at KES {fw_price_kg}/kg.\n\n{ctx}\n\n"
+                        f"6-8 bullets: school viability, grid/LPG access, firewood market, risks, recommendation.")
                     st.markdown(summary.content)
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                except Exception as e: st.error(f"Error: {e}")
 
-
-# ─────────────────────────────────────────────────────────────
-# FOOTER
-# ─────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown(
-    "<div style='text-align:center;color:#aaa;font-size:.8rem'>"
-    "CleanCook v3 · LangChain + Tavily + OpenStreetMap + Streamlit · "
-    "Benchmark: Machakos High School, Kenya"
-    "</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center;color:#aaa;font-size:.8rem'>"
+            "CleanCook v6 · Map pin geolocation · KIPPRA 2024 · FEWS NET · MoE 2025 · LangChain + Tavily"
+            "</div>",unsafe_allow_html=True)
