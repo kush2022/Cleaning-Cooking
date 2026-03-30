@@ -214,21 +214,66 @@ def calc_fw(n,fw_price,fw_kg):
 
 # ─── SESSION STATE ─────────────────────────────────────────────
 for k,v in [("geo_confirmed",False),("geo",None),("clicked_lat",None),
-             ("clicked_lng",None),("chat_msgs",[]),("geo_status",""),("geo_source","")]:
+             ("clicked_lng",None),("chat_msgs",[]),("geo_status",""),
+             ("geo_source",""),("selected_institution",None)]:
     if k not in st.session_state: st.session_state[k]=v
 
 
-# ─── NOMINATIM GEOCODE (silent, no fallback, returns None if not found) ────
+# ─── INSTITUTION DATABASE (loaded from CSV upload) ──────────────
+import csv as _csv, re as _re, io as _io
+
+def _parse_gps(gps_str):
+    if not gps_str or not gps_str.strip(): return None, None
+    gps = gps_str.strip()
+    m = _re.match(r"^(-?\d+\.\d+)\s+(-?\d+\.\d+)", gps)
+    if m: return float(m.group(1)), float(m.group(2))
+    clean = gps.replace('""'  , '"'  )
+    lat_m = _re.search(r"(-?\d+)[°º](\d+)[\'′](\d+\.?\d*)[\"\u2033]{1,2}\s*([NSns])", clean)
+    lon_m = _re.search(r"(\d+)[°º](\d+)[\'′](\d+\.?\d*)[\"\u2033]{1,2}\s*([EWew])", clean)
+    if lat_m and lon_m:
+        def d(a,b,c,h): v=abs(float(a))+float(b)/60+float(c)/3600; return -v if h.upper() in('S','W') else v
+        return d(*lat_m.groups()), d(*lon_m.groups())
+    m3 = _re.findall(r"(-?\d+\.?\d*)\s*°?\s*([NSns])[,;\s]+(-?\d+\.?\d*)\s*°?\s*([EWew])", clean)
+    if m3: return float(m3[0][0])*(-1 if m3[0][1].upper()=="S" else 1), float(m3[0][2])*(-1 if m3[0][3].upper()=="W" else 1)
+    return None, None
+
+def parse_institutions_csv(file_bytes):
+    """Parse institutions CSV bytes. Returns sorted list of institution dicts."""
+    out = []
+    try:
+        text = file_bytes.decode("utf-8-sig")
+        for r in _csv.DictReader(_io.StringIO(text)):
+            lat, lng = _parse_gps(r.get("GPS Location",""))
+            name = r.get("Institution Name","").strip()
+            if lat and name and -5.0<=lat<=5.0 and 33.9<=lng<=42.0:
+                out.append({
+                    "name":           name,
+                    "lat":            round(lat, 6),
+                    "lng":            round(lng, 6),
+                    "county":         r.get("County","").strip(),
+                    "type":           r.get("Institution Type","").strip(),
+                    "ownership":      r.get("Ownership Type","").strip(),
+                    "school_type":    r.get("School Type","").strip(),
+                    "students":       r.get("Total People","").strip(),
+                    "meals_per_day":  r.get("Total Meals Per Day","").strip(),
+                    "cooking_method": r.get("Cooking Method","").strip(),
+                })
+    except Exception:
+        pass
+    return sorted(out, key=lambda x: x["name"])
+
+# Refreshed each rerun after sidebar uploader populates session state
+# (defined again before location picker below)
+INSTITUTIONS  = []
+INST_NAMES    = []
+INST_LOOKUP   = {}
+
+# ─── NOMINATIM (fallback if institution not in database) ─────────
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 NOM_HEADERS   = {"User-Agent": "CleanCookApp/7.0 (school-energy-transition-kenya)"}
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def nominatim_geocode(query: str):
-    """
-    Query Nominatim for a single best result restricted to Kenya.
-    Returns (lat, lng, display_name) or None if nothing found.
-    Cached for 1 hour.
-    """
     try:
         r = requests.get(NOMINATIM_URL,
             params={"q": query, "format": "json", "limit": 1, "countrycodes": "ke"},
@@ -248,6 +293,27 @@ with st.sidebar:
     st.markdown("### ⚙️ API Keys")
     openai_key=st.text_input("OpenAI API Key",type="password",value=os.environ.get("OPENAI_API_KEY",""))
     tavily_key=st.text_input("Tavily API Key", type="password",value=os.environ.get("TAVILY_API_KEY",""))
+    st.divider()
+
+    st.markdown("### 📂 Institution Database")
+    uploaded_csv = st.file_uploader(
+        "Upload institutions CSV",
+        type=["csv"],
+        help="Upload the institutions export CSV file to enable the school search dropdown.",
+        label_visibility="collapsed",
+    )
+    if uploaded_csv is not None:
+        raw = uploaded_csv.read()
+        parsed = parse_institutions_csv(raw)
+        if parsed:
+            st.session_state["institutions"] = parsed
+            st.caption(f"✅ {len(parsed):,} institutions loaded")
+        else:
+            st.warning("Could not parse the CSV. Check the file format.")
+    elif st.session_state.get("institutions"):
+        st.caption(f"✅ {len(st.session_state['institutions']):,} institutions loaded")
+    else:
+        st.caption("No file loaded — upload to enable institution search.")
     st.divider()
 
     st.markdown("### 🏫 School Details")
@@ -290,27 +356,38 @@ with st.sidebar:
     # ── Location status in sidebar ──
     st.markdown("### 📍 School Location")
     if st.session_state.geo_confirmed and st.session_state.geo:
-        g=st.session_state.geo
-        src_icon = "🌍" if st.session_state.geo_source == "geocoded" else "📌"
+        g    = st.session_state.geo
+        inst = g.get("institution")
+        src  = g.get("type","")
+        src_icon = "🟢" if src=="database" else "📌"
+        src_lbl  = "Database" if src=="database" else "Map pin"
         st.markdown(
             f'<div style="background:#e8f5ee;border:2px solid #1a6b3c;border-radius:8px;'
             f'padding:10px 12px;font-size:.83rem;color:#1a4a2c">'
-            f'✅ <b>Location confirmed</b> {src_icon}<br>'
-            f'<span style="color:#555;font-size:.78rem">{g.get("display_name","")[:55]}...</span><br>'
-            f'<span style="font-family:monospace">{g["lat"]:.5f}, {g["lng"]:.5f}</span>'
+            f'✅ <b>Confirmed</b> · {src_icon} {src_lbl}<br>'
+            f'<b style="font-size:.9rem">{g.get("display_name","")[:50]}</b><br>'
+            f'<span style="font-family:monospace;font-size:.76rem">{g["lat"]:.5f}, {g["lng"]:.5f}</span>'
             f'</div>', unsafe_allow_html=True)
+        if inst:
+            st.caption(f"👥 {inst['students']} students · 🍽 {inst['meals_per_day']} meals/day · 🔥 {inst['cooking_method'] or 'Unknown'}")
         st.markdown("")
         if st.button("🔄 Change Location", use_container_width=True):
-            st.session_state.geo_confirmed=False
-            st.session_state.geo=None
-            st.session_state.clicked_lat=None
-            st.session_state.clicked_lng=None
-            st.session_state.geo_status=""
-            st.session_state.geo_source=""
+            st.session_state.geo_confirmed     = False
+            st.session_state.geo               = None
+            st.session_state.clicked_lat       = None
+            st.session_state.clicked_lng       = None
+            st.session_state.geo_status        = ""
+            st.session_state.geo_source        = ""
+            st.session_state.selected_institution = None
             st.rerun()
     else:
-        st.caption("Geocode by name or drop a pin on the map.")
+        st.caption(f"Search from {len(INSTITUTIONS):,} institutions or click the map.")
 
+
+# Refresh institution lists from session state each rerun
+INSTITUTIONS  = st.session_state.get("institutions", [])
+INST_NAMES    = [i["name"] for i in INSTITUTIONS]
+INST_LOOKUP   = {i["name"]: i for i in INSTITUTIONS}
 
 # ─── LOCATION PICKER — blocks app until location confirmed ─────
 if not st.session_state.geo_confirmed:
@@ -319,84 +396,100 @@ if not st.session_state.geo_confirmed:
     st.markdown('<div class="subtitle">School Energy Transition Platform</div>',unsafe_allow_html=True)
     st.markdown("---")
 
-    # ── Step 1: Geocode by name ──────────────────────────────────
-    st.markdown("### 📍 Locate Your School")
+    st.markdown("### 📍 Locate Your School or Institution")
+    st.markdown(
+        f'<div class="pin-hint">'
+        f'Select your institution from the dropdown below ({len(INSTITUTIONS):,} institutions loaded). '
+        f'The map will zoom to its exact location. You can also click the map to fine-tune the pin.'
+        f'</div>', unsafe_allow_html=True)
 
-    col_gc, col_gc2 = st.columns([3, 1])
-    with col_gc:
-        geocode_query = st.text_input(
-            "School name & county",
-            value=f"{school_name}, {county}, Kenya",
-            placeholder="e.g. Gitwe High School, Kiambu, Kenya",
+    # ── Row 1: Searchable institution dropdown + confirm button ──
+    col_drop, col_confirm = st.columns([5, 1])
+
+    with col_drop:
+        # st.selectbox has native search/filter built in — type to filter
+        inst_options = ["— Type to search or scroll —"] + INST_NAMES
+        sel = st.selectbox(
+            f"Search institution ({len(INSTITUTIONS):,} available)",
+            options=inst_options,
+            index=0,
+            key="inst_dropdown",
             label_visibility="collapsed",
-            key="geocode_input",
         )
-    with col_gc2:
-        geocode_btn = st.button("🔍 Geocode", type="primary", use_container_width=True)
 
-    # Run geocode when button clicked
-    if geocode_btn and geocode_query.strip():
-        with st.spinner(f"Searching for \"{geocode_query.strip()}\"..."):
-            result = nominatim_geocode(geocode_query.strip())
-        if result:
-            lat_gc, lng_gc, display_gc = result
-            st.session_state.clicked_lat   = lat_gc
-            st.session_state.clicked_lng   = lng_gc
-            st.session_state.geo_status    = f"✅ Found: {display_gc[:90]}"
-            st.session_state.geo_source    = "geocoded"
+    with col_confirm:
+        select_btn = st.button("📍 Load", type="primary", use_container_width=True,
+                               disabled=(sel == "— Type to search or scroll —"))
+
+    # When user selects from dropdown and clicks Load
+    if select_btn and sel != "— Type to search or scroll —":
+        inst = INST_LOOKUP.get(sel)
+        if inst:
+            st.session_state.clicked_lat       = inst["lat"]
+            st.session_state.clicked_lng       = inst["lng"]
+            st.session_state.geo_source        = "database"
+            st.session_state.geo_status        = f"✅ {inst['name']} — {inst['county']} ({inst['type']})"
+            st.session_state.selected_institution = inst
             st.rerun()
-        else:
-            st.session_state.geo_status = (
-                f"⚠️ Could not find **\"{geocode_query.strip()}\"** in Kenya via OpenStreetMap. "
-                f"Many Kenyan schools are not in OSM — please **click the map** to place your pin manually."
-            )
-            st.session_state.geo_source = ""
 
-    # Show geocode status message
+    # ── Row 2: Status message ─────────────────────────────────────
     if st.session_state.geo_status:
         if st.session_state.geo_status.startswith("✅"):
-            st.success(st.session_state.geo_status)
+            # Show institution details card
+            inst = st.session_state.selected_institution
+            if inst:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("County", inst["county"] or "—")
+                c2.metric("Students", inst["students"] or "—")
+                c3.metric("Meals/Day", inst["meals_per_day"] or "—")
+                c4.metric("Current Fuel", inst["cooking_method"] or "—")
         else:
             st.warning(st.session_state.geo_status)
 
-    st.markdown(
-        '<div class="pin-hint" style="margin-top:12px">'
-        '🗺️ <b>The pin appears on the map below.</b> '
-        'Geocoded schools are placed automatically. '
-        'If the pin is wrong or missing, <b>click directly on the map</b> to place it precisely. '
-        'Then click <b>Confirm Location</b>.'
-        '</div>', unsafe_allow_html=True)
+    st.markdown("---")
 
-    # ── Map: show geocoded pin OR let user click ─────────────────
-    # Centre on Kenya, or zoom to existing pin
+    # ── Map: show institution pin or let user click ───────────────
     if st.session_state.clicked_lat:
         picker_center = [st.session_state.clicked_lat, st.session_state.clicked_lng]
-        picker_zoom   = 15 if st.session_state.geo_source == "geocoded" else 14
+        picker_zoom   = 15
     else:
-        picker_center = [0.0236, 37.9062]   # Kenya centre
+        picker_center = [0.0236, 37.9062]
         picker_zoom   = 6
 
     picker_map = folium.Map(location=picker_center, zoom_start=picker_zoom,
                             tiles="CartoDB positron")
 
-    # Draw current pin
+    # Draw pin
     if st.session_state.clicked_lat:
-        pin_source = "Geocoded" if st.session_state.geo_source=="geocoded" else "Map click"
+        src = st.session_state.geo_source
+        pin_color = "green" if src == "database" else "orange"
+        src_label = "From database" if src == "database" else "Map click"
+        inst = st.session_state.selected_institution
+        popup_html = (
+            f"<b>{inst['name'] if inst else school_name}</b><br>"
+            f"{inst['county'] if inst else county}<br>"
+            f"<small>{src_label}</small><br>"
+            f"Students: {inst['students'] if inst else '—'}<br>"
+            f"Fuel: {inst['cooking_method'] if inst else '—'}<br>"
+            f"Lat: {st.session_state.clicked_lat:.5f}<br>"
+            f"Lng: {st.session_state.clicked_lng:.5f}"
+        )
         folium.Marker(
             [st.session_state.clicked_lat, st.session_state.clicked_lng],
-            tooltip=f"📍 {school_name} ({pin_source}) — click map to move",
-            popup=folium.Popup(
-                f"<b>{school_name}</b><br>{county}<br>"
-                f"<small>{pin_source}</small><br>"
-                f"Lat: {st.session_state.clicked_lat:.5f}<br>"
-                f"Lng: {st.session_state.clicked_lng:.5f}",
-                max_width=220),
-            icon=folium.Icon(
-                color="green" if st.session_state.geo_source=="geocoded" else "orange",
-                icon="map-marker", prefix="fa"),
+            tooltip=f"📍 {inst['name'] if inst else school_name} ({src_label})",
+            popup=folium.Popup(popup_html, max_width=230),
+            icon=folium.Icon(color=pin_color, icon="map-marker", prefix="fa"),
         ).add_to(picker_map)
 
-    # Live cursor coordinates
+    # Show all institution markers lightly when zoomed out
+    if picker_zoom <= 8:
+        for inst_item in INSTITUTIONS[:200]:   # limit for performance
+            folium.CircleMarker(
+                [inst_item["lat"], inst_item["lng"]],
+                radius=3, color="#1a6b3c", fill=True, fill_opacity=0.5,
+                tooltip=inst_item["name"],
+            ).add_to(picker_map)
+
     MousePosition(
         position="bottomleft", separator=" | ", prefix="Cursor:",
         lat_formatter="function(num){return num.toFixed(5);}",
@@ -409,66 +502,81 @@ if not st.session_state.geo_confirmed:
                              returned_objects=["last_clicked"],
                              key="location_picker")
     with col_side:
-        st.markdown("#### Steps")
+        st.markdown("#### How to use")
         st.markdown(
-            "**Option A — Geocode:**\n"
-            "1. Enter school name above\n"
-            "2. Click **Geocode**\n"
-            "3. Pin appears on map\n\n"
-            "**Option B — Click map:**\n"
-            "1. Zoom into school area\n"
-            "2. Click exact location\n"
-            "3. Orange pin appears\n\n"
-            "Then click **Confirm** ↓"
+            "**Step 1 — Search dropdown:**\n"
+            "- Type school name to filter\n"
+            "- Select correct institution\n"
+            "- Click **📍 Load** — pin drops\n\n"
+            "**Step 2 — Fine-tune (optional):**\n"
+            "- Click map to move pin\n"
+            "- Zoom in for precision\n\n"
+            "**Step 3 — Confirm:**\n"
+            "- Click **✅ Confirm** below"
         )
         st.markdown("---")
 
         if st.session_state.clicked_lat:
-            src_label = "🌍 Geocoded" if st.session_state.geo_source=="geocoded" else "📌 Map click"
+            src = st.session_state.geo_source
+            src_icon = "🟢" if src=="database" else "📌"
+            src_txt  = "Database" if src=="database" else "Map click"
             st.markdown(
                 f'<div class="pin-pending">'
-                f'<b>{src_label}</b><br>'
+                f'<b>{src_icon} {src_txt}</b><br>'
                 f'Lat: <code>{st.session_state.clicked_lat:.5f}</code><br>'
                 f'Lng: <code>{st.session_state.clicked_lng:.5f}</code>'
                 f'</div>', unsafe_allow_html=True)
             st.markdown("")
+
             if st.button("✅ Confirm Location", type="primary", use_container_width=True):
-                display = (st.session_state.geo_status.replace("✅ Found: ","")
-                           if st.session_state.geo_source=="geocoded"
-                           else f"{school_name}, {county} (map pin)")
+                inst = st.session_state.selected_institution
+                display = (
+                    f"{inst['name']}, {inst['county']}" if inst
+                    else f"{school_name}, {county} (map pin)"
+                )
                 st.session_state.geo = {
                     "lat":          st.session_state.clicked_lat,
                     "lng":          st.session_state.clicked_lng,
                     "display_name": display,
                     "type":         st.session_state.geo_source or "map_pin",
+                    "institution":  inst,
                 }
                 st.session_state.geo_confirmed = True
                 st.rerun()
+
             if st.button("🗑️ Clear Pin", use_container_width=True):
-                st.session_state.clicked_lat=None
-                st.session_state.clicked_lng=None
-                st.session_state.geo_status=""
-                st.session_state.geo_source=""
+                st.session_state.clicked_lat        = None
+                st.session_state.clicked_lng        = None
+                st.session_state.geo_status         = ""
+                st.session_state.geo_source         = ""
+                st.session_state.selected_institution = None
                 st.rerun()
         else:
-            st.info("No pin yet.\nGeocode above or click the map.")
+            st.info("Search and select an institution, or click the map.")
 
-    # Capture manual map click
+    # Capture manual map click — overrides database pin
     if map_data and map_data.get("last_clicked"):
         new_lat = map_data["last_clicked"]["lat"]
         new_lng = map_data["last_clicked"]["lng"]
         if new_lat != st.session_state.clicked_lat or new_lng != st.session_state.clicked_lng:
-            st.session_state.clicked_lat = new_lat
-            st.session_state.clicked_lng = new_lng
-            st.session_state.geo_source  = "map_pin"
-            st.session_state.geo_status  = ""
+            st.session_state.clicked_lat        = new_lat
+            st.session_state.clicked_lng        = new_lng
+            st.session_state.geo_source         = "map_pin"
+            st.session_state.geo_status         = ""
+            st.session_state.selected_institution = None
             st.rerun()
 
     st.stop()
 
 
 # ─── CONFIRMED — compute everything ───────────────────────────
-geo=st.session_state.geo; lat,lng=geo["lat"],geo["lng"]
+geo = st.session_state.get("geo")
+if not isinstance(geo, dict) or "lat" not in geo or "lng" not in geo:
+    st.session_state.geo_confirmed = False
+    st.warning("Location is not confirmed yet. Please select or pin a school location and confirm it.")
+    st.stop()
+
+lat, lng = geo["lat"], geo["lng"]
 fw_result =compute_all_meals(served_meals,prices)
 cc_result =compute_clean_cook(fw_result)
 sizing    =calc_sizing(num_students,max(len(served_meals),1))

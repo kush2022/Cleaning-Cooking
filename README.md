@@ -40,3 +40,12 @@ streamlit run src/clean_cooking_app.py
 
 - `src/clean_cooking_app.py` — Streamlit UI entry point.
 - `src/clean_cooking.py` — Core logic/utilities.
+
+
+
+<!-- Notes -->
+
+Per meal per student 
+the cost of the fireword 
+incase there is LPG 
+The savings from transition from firewood to LPG 
